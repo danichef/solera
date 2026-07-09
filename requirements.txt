@@ -1,0 +1,16 @@
+numpy>=1.24
+scipy>=1.10
+pillow>=9.0
+tqdm
+
+torch>=2.2
+torchvision
+diffusers>=0.27
+transformers>=4.38
+accelerate>=0.27
+safetensors
+huggingface_hub
+
+pandas
+scikit-image>=0.22
+lpips

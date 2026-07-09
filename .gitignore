@@ -1,0 +1,18 @@
+# secrets and private notes
+keys.env
+RUNPOD_GUIDE.md
+
+# environments and IDE
+.venv/
+.idea/
+__pycache__/
+*.pyc
+
+# system
+.DS_Store
+
+# generated data, models and results
+data/
+*.tar
+results/
+restored_out/
