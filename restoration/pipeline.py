@@ -544,6 +544,10 @@ class CoinRestorationPipeline:
                         desc="training", unit="step",
                         disable=not accelerator.is_main_process)
 
+        log_path = out_dir / "train_log.csv"
+        if accelerator.is_main_process and not log_path.exists():
+            log_path.write_text("step,loss,lr\n")
+
         unet.train()
         done = False
         while not done:
@@ -601,11 +605,17 @@ class CoinRestorationPipeline:
                     lr_schedule.step()
                     global_step += 1
                     progress.update(1)
-                    if global_step % 10 == 0:
-                        progress.set_postfix(loss=f"{loss.item():.4f}",
-                                             lr=f"{lr_schedule.get_last_lr()[0]:.1e}")
-
                     is_main = accelerator.is_main_process
+                    if global_step % 10 == 0:
+                        current_loss = loss.item()
+                        current_lr = lr_schedule.get_last_lr()[0]
+                        progress.set_postfix(loss=f"{current_loss:.4f}",
+                                             lr=f"{current_lr:.1e}")
+                        if is_main:
+                            with open(log_path, "a") as log:
+                                log.write(f"{global_step},{current_loss:.6f},"
+                                          f"{current_lr:.6e}\n")
+
                     if is_main and global_step % cfg.val_every == 0:
                         self._save_preview(components, accelerator, ema, val_rows,
                                            out_dir / "previews" / f"step_{global_step}.png",
