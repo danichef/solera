@@ -684,6 +684,7 @@ class CoinRestorationPipeline:
                           for r in chunk]
 
             restored_batch = pipe([PROMPT] * len(chunk), image=damaged,
+                                  height=cfg.resolution, width=cfg.resolution,
                                   num_inference_steps=cfg.steps,
                                   image_guidance_scale=cfg.image_guidance,
                                   guidance_scale=guidance,
@@ -817,7 +818,9 @@ class CoinRestorationPipeline:
         for path in paths:
             for suffix, img in self._input_faces(path):
                 generator = torch.Generator(device).manual_seed(cfg.seed)
-                restored = pipe(PROMPT, image=img, num_inference_steps=cfg.steps,
+                restored = pipe(PROMPT, image=img,
+                                height=cfg.resolution, width=cfg.resolution,
+                                num_inference_steps=cfg.steps,
                                 image_guidance_scale=cfg.image_guidance,
                                 guidance_scale=cfg.guidance,
                                 generator=generator).images[0]
@@ -996,7 +999,9 @@ class CoinRestorationPipeline:
                 clean = clean.resize((res, res))
                 with torch.autocast(device.type, dtype=autocast_dtype,
                                     enabled=autocast_dtype != torch.float32):
-                    restored = pipe(PROMPT, image=damaged, num_inference_steps=20,
+                    restored = pipe(PROMPT, image=damaged,
+                                    height=res, width=res,
+                                    num_inference_steps=20,
                                     image_guidance_scale=1.5, guidance_scale=6.0,
                                     generator=torch.Generator(device).manual_seed(0)
                                     ).images[0]
