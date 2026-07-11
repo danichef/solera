@@ -789,8 +789,215 @@ class CoinRestorationPipeline:
             by_chip.to_csv(f)
             f.write("\n# by big flan clip\n")
             by_clip.to_csv(f)
+
+        fid = None if cfg.no_fid else self._compute_fid()
+        self._make_plots(full, results)
+        self._write_report(full, by_grade, by_chip, by_clip, fid, results)
+
         print(f"\n-> {results / 'results_per_image.csv'}")
         print(f"-> {results / 'results_summary.csv'}")
+        print(f"-> {results / 'results_report.md'}")
+        print(f"-> {results / 'plots/'}")
+
+    # Computes distribution-level FID: restored vs clean, plus the damaged vs
+    # clean baseline that shows how far restoration moved the distribution.
+    # @output dict with both scores, or None when pytorch-fid is missing
+    def _compute_fid(self):
+        try:
+            from pytorch_fid import fid_score
+        except ImportError:
+            print("pytorch-fid not installed, skipping FID (pip install pytorch-fid)")
+            return None
+
+        cfg = self.cfg
+        clean_dir = str(Path(cfg.data) / "test" / "clean")
+        damaged_dir = str(Path(cfg.data) / "test" / "damaged")
+        restored_dir = str(Path(cfg.results) / "restored")
+
+        print("computing FID (restored vs clean)")
+        fid_restored = fid_score.calculate_fid_given_paths(
+            [restored_dir, clean_dir], batch_size=32, device=cfg.device, dims=2048)
+        print("computing FID baseline (damaged vs clean)")
+        fid_damaged = fid_score.calculate_fid_given_paths(
+            [damaged_dir, clean_dir], batch_size=32, device=cfg.device, dims=2048)
+
+        print(f"FID restored: {fid_restored:.2f}   FID damaged: {fid_damaged:.2f}")
+        return {"restored": fid_restored, "damaged": fid_damaged}
+
+    # Draws the evaluation figures: metrics by damage state, the per-image
+    # improvement scatter, metric distributions, and the training loss curve.
+    # @params full: per-image dataframe with metric columns
+    # @params results: results folder; figures land in results/plots
+    def _make_plots(self, full, results):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plots = Path(results) / "plots"
+        plots.mkdir(exist_ok=True)
+
+        restored_color = "#2a78d6"
+        damaged_color = "#8a8983"
+        grade_colors = {"f": "#2a78d6", "vg": "#1baf7a",
+                        "g": "#eda100", "ag": "#4a3aa7"}
+        text_color = "#0b0b0b"
+        plt.rcParams.update({"font.size": 11, "text.color": text_color,
+                             "axes.labelcolor": text_color,
+                             "xtick.color": "#52514e", "ytick.color": "#52514e",
+                             "axes.edgecolor": "#d5d4cf", "figure.dpi": 150})
+
+        def style(ax):
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.grid(axis="y", color="#e8e7e3", linewidth=0.8)
+            ax.set_axisbelow(True)
+
+        def grouped_bars(path, groups, order, title_suffix):
+            metrics = [("psnr", "psnr_damaged", "PSNR (dB, higher better)"),
+                       ("ssim", None, "SSIM (higher better)"),
+                       ("lpips", "lpips_damaged", "LPIPS (lower better)")]
+            metrics = [(m, b, t) for m, b, t in metrics if m in full.columns]
+            fig, axes = plt.subplots(1, len(metrics), figsize=(4.2 * len(metrics), 3.6))
+            for ax, (metric, baseline, title) in zip(np.atleast_1d(axes), metrics):
+                means = groups[metric].mean().reindex(order)
+                stds = groups[metric].std().reindex(order)
+                x = np.arange(len(order))
+                width = 0.38 if baseline else 0.6
+                ax.bar(x, means, width, yerr=stds, capsize=3,
+                       color=restored_color, label="restored")
+                if baseline and baseline in full.columns:
+                    base_means = groups[baseline].mean().reindex(order)
+                    base_stds = groups[baseline].std().reindex(order)
+                    ax.bar(x + width, base_means, width, yerr=base_stds, capsize=3,
+                           color=damaged_color, label="damaged")
+                    ax.set_xticks(x + width / 2)
+                else:
+                    ax.set_xticks(x)
+                ax.set_xticklabels(order)
+                ax.set_title(f"{title}\nby {title_suffix}", fontsize=11)
+                style(ax)
+            first = np.atleast_1d(axes)[0]
+            if first.get_legend_handles_labels()[0]:
+                first.legend(frameon=False)
+            fig.tight_layout()
+            fig.savefig(path, bbox_inches="tight")
+            plt.close(fig)
+
+        grouped_bars(plots / "metrics_by_grade.png",
+                     full.groupby("sand_grade"), SAND_GRADES, "sanding grade")
+        grouped_bars(plots / "metrics_by_chip.png",
+                     full.groupby("chip_bin"),
+                     ["none", "light", "medium", "heavy"], "chip severity")
+
+        if "lpips" in full.columns and "lpips_damaged" in full.columns:
+            fig, ax = plt.subplots(figsize=(5.4, 5.4))
+            for grade in SAND_GRADES:
+                sub = full[full["sand_grade"] == grade]
+                ax.scatter(sub["lpips_damaged"], sub["lpips"], s=8, alpha=0.5,
+                           color=grade_colors[grade], label=grade, linewidths=0)
+            limit = float(max(full["lpips_damaged"].max(), full["lpips"].max())) * 1.05
+            ax.plot([0, limit], [0, limit], color="#b4b2a9", linewidth=1,
+                    linestyle="--")
+            ax.set_xlim(0, limit)
+            ax.set_ylim(0, limit)
+            ax.set_xlabel("LPIPS damaged vs clean")
+            ax.set_ylabel("LPIPS restored vs clean")
+            ax.set_title("Per-image improvement (below the line = improved)",
+                         fontsize=11)
+            ax.legend(title="grade", frameon=False)
+            style(ax)
+            ax.grid(axis="x", color="#e8e7e3", linewidth=0.8)
+            fig.tight_layout()
+            fig.savefig(plots / "lpips_improvement.png", bbox_inches="tight")
+            plt.close(fig)
+
+        pairs = [("psnr", "psnr_damaged", "PSNR (dB)"),
+                 ("lpips", "lpips_damaged", "LPIPS")]
+        pairs = [(m, b, t) for m, b, t in pairs
+                 if m in full.columns and b in full.columns]
+        if pairs:
+            fig, axes = plt.subplots(1, len(pairs), figsize=(5.2 * len(pairs), 3.6))
+            for ax, (metric, baseline, title) in zip(np.atleast_1d(axes), pairs):
+                ax.hist(full[baseline].dropna(), bins=40, color=damaged_color,
+                        alpha=0.6, label="damaged")
+                ax.hist(full[metric].dropna(), bins=40, color=restored_color,
+                        alpha=0.6, label="restored")
+                ax.set_xlabel(title)
+                ax.set_ylabel("images")
+                ax.legend(frameon=False)
+                style(ax)
+            fig.tight_layout()
+            fig.savefig(plots / "distributions.png", bbox_inches="tight")
+            plt.close(fig)
+
+        if self.cfg.train_log and Path(self.cfg.train_log).exists():
+            import pandas as pd
+            log = pd.read_csv(self.cfg.train_log)
+            fig, ax = plt.subplots(figsize=(7.5, 3.6))
+            ax.plot(log["step"], log["loss"], color="#9ec5f4", linewidth=0.7)
+            smooth = log["loss"].rolling(100, min_periods=1).mean()
+            ax.plot(log["step"], smooth, color="#1c5cab", linewidth=1.8,
+                    label="rolling mean (100)")
+            ax.set_xlabel("step")
+            ax.set_ylabel("training loss")
+            ax.legend(frameon=False)
+            style(ax)
+            fig.tight_layout()
+            fig.savefig(plots / "training_loss.png", bbox_inches="tight")
+            plt.close(fig)
+
+    # Writes a human-readable evaluation report next to the csv outputs.
+    # @params full: per-image dataframe
+    # @params by_grade / by_chip / by_clip: grouped summary tables
+    # @params fid: FID scores dict or None
+    # @params results: results folder
+    def _write_report(self, full, by_grade, by_chip, by_clip, fid, results):
+        def stat(column):
+            if column not in full.columns:
+                return "n/a"
+            return f"{full[column].mean():.4f} ± {full[column].std():.4f}"
+
+        lines = ["# Solera evaluation report", ""]
+        lines.append(f"Test images scored: {len(full)} "
+                     f"({full['coin_id'].nunique()} coins)")
+        lines.append("All PSNR / SSIM / LPIPS values are masked to the original "
+                     "coin silhouette. 'Damaged' columns score the unrestored "
+                     "input against the same target, as the baseline.")
+        lines.append("")
+        lines.append("## Overall")
+        lines.append("")
+        lines.append("| metric | restored | damaged baseline |")
+        lines.append("|---|---|---|")
+        lines.append(f"| PSNR (dB, higher better) | {stat('psnr')} "
+                     f"| {stat('psnr_damaged')} |")
+        lines.append(f"| SSIM (higher better) | {stat('ssim')} | n/a |")
+        lines.append(f"| LPIPS (lower better) | {stat('lpips')} "
+                     f"| {stat('lpips_damaged')} |")
+        if fid:
+            lines.append(f"| FID (lower better) | {fid['restored']:.2f} "
+                         f"| {fid['damaged']:.2f} |")
+        lines.append("")
+
+        for name, table in (("by sanding grade", by_grade),
+                            ("by chip severity", by_chip),
+                            ("by big flan clip", by_clip)):
+            lines.append(f"## Metrics {name}")
+            lines.append("")
+            lines.append(table.to_markdown())
+            lines.append("")
+
+        lines.append("## Files")
+        lines.append("")
+        lines.append("- `results_per_image.csv` — every metric for every image")
+        lines.append("- `results_summary.csv` — the grouped tables above")
+        lines.append("- `plots/metrics_by_grade.png`, `plots/metrics_by_chip.png` "
+                     "— restored vs damaged by damage state")
+        lines.append("- `plots/lpips_improvement.png` — per-image before/after")
+        lines.append("- `plots/distributions.png` — metric histograms")
+        if self.cfg.train_log and Path(self.cfg.train_log).exists():
+            lines.append("- `plots/training_loss.png` — smoothed loss curve")
+
+        (Path(results) / "results_report.md").write_text("\n".join(lines) + "\n")
 
     # Restores arbitrary coin images with a saved model; the entry point for
     # using the model after the project.
@@ -1222,6 +1429,8 @@ def parse_args():
     evaluate.add_argument("--results", required=True)
     evaluate.add_argument("--device", default="cpu")
     evaluate.add_argument("--no-lpips", action="store_true")
+    evaluate.add_argument("--no-fid", action="store_true")
+    evaluate.add_argument("--train-log", default=None)
 
     add_shared(restore)
     restore.add_argument("--model", required=True)

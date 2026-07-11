@@ -14,3 +14,6 @@ huggingface_hub
 pandas
 scikit-image>=0.22
 lpips
+matplotlib
+pytorch-fid
+tabulate
