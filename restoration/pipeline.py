@@ -370,7 +370,7 @@ class CoinRestorationPipeline:
             if not (sweep_dir / "results_metadata.csv").exists():
                 self.infer(override_split="val", override_limit=100,
                            override_guidance=guidance, override_out=sweep_dir,
-                           override_tar=False)
+                           override_tar=False, override_samples=1)
             scores[guidance] = self._mean_masked_psnr(sweep_dir)
             print(f"guidance {guidance}: masked PSNR {scores[guidance]:.2f} dB")
 
@@ -642,15 +642,18 @@ class CoinRestorationPipeline:
             if cfg.push_to_hub:
                 self._push_to_hub(final_dir)
 
-    # Restores every image of one split with the trained model and writes
-    # triptychs plus a metadata csv recording what state each came from.
+    # Restores every image of one split with the trained model. With
+    # --num-samples above 1 it draws several restorations per image from
+    # different noise seeds, showing the distribution of plausible originals,
+    # and composes a "fan" strip (damaged | samples | clean) per image.
     # The override arguments let the guidance sweep reuse this with different
     # settings without touching the main config.
     # @params override_split / override_limit / override_guidance /
-    #         override_out / override_tar: optional one-off settings
-    # @output results folder with restored/, triptychs/, results_metadata.csv
+    #         override_out / override_tar / override_samples: one-off settings
+    # @output results folder with restored/, triptychs/, fans/, results_metadata.csv
     def infer(self, override_split=None, override_limit=None,
-              override_guidance=None, override_out=None, override_tar=None):
+              override_guidance=None, override_out=None, override_tar=None,
+              override_samples=None):
         import torch
         from diffusers import DiffusionPipeline
 
@@ -661,27 +664,33 @@ class CoinRestorationPipeline:
         limit = override_limit if override_limit is not None else cfg.limit
         guidance = override_guidance if override_guidance is not None else cfg.guidance
         make_tar = override_tar if override_tar is not None else cfg.results_tar
+        n_samples = override_samples if override_samples is not None else cfg.num_samples
         (out / "restored").mkdir(parents=True, exist_ok=True)
         (out / "triptychs").mkdir(exist_ok=True)
+        if n_samples > 1:
+            (out / "fans").mkdir(exist_ok=True)
 
         model_path = cfg.model or str(Path(cfg.output_dir) / "final")
         rows = self._metadata_rows(split)
         if limit:
             rows = rows[:limit]
-        print(f"{len(rows)} {split} samples, model: {model_path}, guidance {guidance}")
+        print(f"{len(rows)} {split} samples x {n_samples} draws, "
+              f"model: {model_path}, guidance {guidance}")
 
         pipe = DiffusionPipeline.from_pretrained(model_path,
                                                  torch_dtype=torch.float16).to("cuda")
         pipe.set_progress_bar_config(disable=True)
 
+        tasks = [(row, k) for row in rows for k in range(n_samples)]
+        pending_fans = {}
         results = []
-        bar = tqdm(range(0, len(rows), cfg.batch), desc="restoring", unit="batch")
+        bar = tqdm(range(0, len(tasks), cfg.batch), desc="restoring", unit="batch")
         for start in bar:
-            chunk = rows[start:start + cfg.batch]
-            damaged = [Image.open(data / r["damaged_path"]).convert("RGB")
-                       for r in chunk]
-            generators = [torch.Generator("cuda").manual_seed(int(r["seed"]))
-                          for r in chunk]
+            chunk = tasks[start:start + cfg.batch]
+            damaged = [Image.open(data / row["damaged_path"]).convert("RGB")
+                       for row, _ in chunk]
+            generators = [torch.Generator("cuda").manual_seed(int(row["seed"]) + 9973 * k)
+                          for row, k in chunk]
 
             restored_batch = pipe([PROMPT] * len(chunk), image=damaged,
                                   height=cfg.resolution, width=cfg.resolution,
@@ -690,24 +699,37 @@ class CoinRestorationPipeline:
                                   guidance_scale=guidance,
                                   generator=generators).images
 
-            for row, damaged_img, restored in zip(chunk, damaged, restored_batch):
-                stem = f"{row['coin_id']}_{row['face']}_{row['sand_grade']}"
+            for (row, k), damaged_img, restored in zip(chunk, damaged, restored_batch):
+                base = f"{row['coin_id']}_{row['face']}_{row['sand_grade']}"
+                stem = f"{base}_s{k}" if n_samples > 1 else base
                 restored_rel = f"restored/{stem}.png"
                 restored.save(out / restored_rel)
 
-                clean = Image.open(data / row["clean_path"]).convert("RGB")
-                width, height = restored.size
-                triptych = Image.new("RGB", (width * 3, height), (255, 255, 255))
-                triptych.paste(damaged_img.resize((width, height)), (0, 0))
-                triptych.paste(restored, (width, 0))
-                triptych.paste(clean.resize((width, height)), (width * 2, 0))
-                triptych_rel = f"triptychs/{stem}.jpg"
-                triptych.save(out / triptych_rel, quality=92)
+                record = dict(row, sample_idx=k, restored_path=restored_rel,
+                              triptych_path="", steps=cfg.steps,
+                              image_guidance=cfg.image_guidance,
+                              guidance=guidance, model=model_path)
 
-                results.append(dict(row, restored_path=restored_rel,
-                                    triptych_path=triptych_rel, steps=cfg.steps,
-                                    image_guidance=cfg.image_guidance,
-                                    guidance=guidance, model=model_path))
+                if k == 0:
+                    clean = Image.open(data / row["clean_path"]).convert("RGB")
+                    width, height = restored.size
+                    triptych = Image.new("RGB", (width * 3, height), (255, 255, 255))
+                    triptych.paste(damaged_img.resize((width, height)), (0, 0))
+                    triptych.paste(restored, (width, 0))
+                    triptych.paste(clean.resize((width, height)), (width * 2, 0))
+                    record["triptych_path"] = f"triptychs/{base}.jpg"
+                    triptych.save(out / record["triptych_path"], quality=92)
+
+                if n_samples > 1:
+                    fan = pending_fans.setdefault(base, [None] * n_samples)
+                    fan[k] = restored
+                    if all(fan):
+                        self._save_fan(out / "fans" / f"{base}.jpg",
+                                       damaged_img, fan,
+                                       Image.open(data / row["clean_path"]).convert("RGB"))
+                        del pending_fans[base]
+
+                results.append(record)
             bar.set_postfix(images=len(results))
 
         with open(out / "results_metadata.csv", "w", newline="") as f:
@@ -720,6 +742,21 @@ class CoinRestorationPipeline:
             with tarfile.open(tar_path, "w") as tar:
                 tar.add(out, arcname=out.name)
             print(f"-> {tar_path} ({tar_path.stat().st_size / 1e9:.2f} GB)")
+
+    # Lays out one image's sample fan: the damaged input, every drawn
+    # restoration, and the clean target in a single row.
+    # @params path: destination jpg
+    # @params damaged_img: the conditioning input
+    # @params samples: list of restored PIL images
+    # @params clean: the ground-truth image
+    def _save_fan(self, path, damaged_img, samples, clean):
+        width, height = samples[0].size
+        cells = [damaged_img.resize((width, height))] + samples \
+            + [clean.resize((width, height))]
+        strip = Image.new("RGB", (width * len(cells), height), (255, 255, 255))
+        for i, cell in enumerate(cells):
+            strip.paste(cell, (i * width, 0))
+        strip.save(path, quality=90)
 
     # Scores the downloaded results against the clean targets with masked
     # PSNR / SSIM / LPIPS, grouped by the damage state each image came from.
@@ -790,14 +827,40 @@ class CoinRestorationPipeline:
             f.write("\n# by big flan clip\n")
             by_clip.to_csv(f)
 
+        best_of = self._best_of_samples(full)
+        if best_of is not None:
+            print(f"\n== best-of-{best_of['n']} across samples ==")
+            for key in ("psnr", "ssim", "lpips"):
+                if key in best_of:
+                    print(f"  {key}: {best_of[key]}")
+
         fid = None if cfg.no_fid else self._compute_fid()
         self._make_plots(full, results)
-        self._write_report(full, by_grade, by_chip, by_clip, fid, results)
+        self._write_report(full, by_grade, by_chip, by_clip, fid, best_of, results)
 
         print(f"\n-> {results / 'results_per_image.csv'}")
         print(f"-> {results / 'results_summary.csv'}")
         print(f"-> {results / 'results_report.md'}")
         print(f"-> {results / 'plots/'}")
+
+    # When several samples were drawn per image, reports the oracle score of
+    # the best draw: how good the distribution's best answer is, per image,
+    # averaged over the test set.
+    # @params full: per-image dataframe with metric columns
+    # @output dict of formatted best-of-N stats, or None for single samples
+    def _best_of_samples(self, full):
+        if "sample_idx" not in full.columns or full["sample_idx"].nunique() < 2:
+            return None
+
+        keys = ["coin_id", "face", "sand_grade"]
+        result = {"n": int(full["sample_idx"].nunique())}
+        directions = [("psnr", "max"), ("ssim", "max"), ("lpips", "min")]
+        for metric, how in directions:
+            if metric not in full.columns:
+                continue
+            per_image = full.groupby(keys)[metric].agg(how)
+            result[metric] = f"{per_image.mean():.4f} ± {per_image.std():.4f}"
+        return result
 
     # Computes distribution-level FID: restored vs clean, plus the damaged vs
     # clean baseline that shows how far restoration moved the distribution.
@@ -950,8 +1013,9 @@ class CoinRestorationPipeline:
     # @params full: per-image dataframe
     # @params by_grade / by_chip / by_clip: grouped summary tables
     # @params fid: FID scores dict or None
+    # @params best_of: best-of-N sample stats dict or None
     # @params results: results folder
-    def _write_report(self, full, by_grade, by_chip, by_clip, fid, results):
+    def _write_report(self, full, by_grade, by_chip, by_clip, fid, best_of, results):
         def stat(column):
             if column not in full.columns:
                 return "n/a"
@@ -977,6 +1041,19 @@ class CoinRestorationPipeline:
             lines.append(f"| FID (lower better) | {fid['restored']:.2f} "
                          f"| {fid['damaged']:.2f} |")
         lines.append("")
+
+        if best_of:
+            lines.append(f"## Best of {best_of['n']} samples per image")
+            lines.append("")
+            lines.append("Oracle score of the best draw per image, showing how "
+                         "good an answer the sampled distribution contains.")
+            lines.append("")
+            lines.append("| metric | best-of-N |")
+            lines.append("|---|---|")
+            for key in ("psnr", "ssim", "lpips"):
+                if key in best_of:
+                    lines.append(f"| {key.upper()} | {best_of[key]} |")
+            lines.append("")
 
         for name, table in (("by sanding grade", by_grade),
                             ("by chip severity", by_chip),
@@ -1417,6 +1494,9 @@ def parse_args():
         p.add_argument("--batch", type=int, default=8)
         p.add_argument("--split", default="test", choices=["test", "val"])
         p.add_argument("--limit", type=int, default=None)
+        p.add_argument("--num-samples", type=int, default=1,
+                       help="restorations drawn per image; above 1 also writes "
+                            "fans/ strips showing the distribution")
         p.add_argument("--no-results-tar", dest="results_tar", action="store_false")
 
     add_shared(train)
