@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import numpy as np
 
 from .base import DamageFilter, DamageResult
@@ -7,17 +5,17 @@ from .sanding_classic import ClassicSandingFilter
 from . import silver_relight as relight
 
 
-# The full wear stage: runs the sanding simulation and then re-lights the
-# result so worn areas gleam like handled silver instead of looking airbrushed.
+# The whole wear stage: sand the coin down, then relight it so the worn areas
+# gleam like handled silver instead of looking airbrushed.
 class SilverWearFilter(DamageFilter):
 
-    # @params grade: preset name passed on to the sanding filter
+    # @params grade: preset name handed on to the sanding filter
     # @params spec_gain / shininess / gate_pct: specular glint settings
     # @params silver_boost: pull toward the coin's metal tone
     # @params fine_amt: fine detail in the shading normals
     # @params shadow_lift: strength of the dark-blob cleanup
-    # @params brightness_bias: target brightness relative to the original
-    # @params light: fixed light direction, estimated from the photo when None
+    # @params brightness_bias: target brightness vs the original
+    # @params light: fixed light direction, or None to estimate it
     # @params spec_grain: hairline scratches carved out of the shine
     def __init__(self, grade="vg", spec_gain=2.1, shininess=10.0,
                  silver_boost=0.55, fine_amt=0.25, gate_pct=45.0,
@@ -42,32 +40,30 @@ class SilverWearFilter(DamageFilter):
         "ag": dict(grade="ag", spec_gain=2.7, shininess=8.0,  silver_boost=0.62, shadow_lift=0.56, gate_pct=54.0, spec_grain=0.55),
     }
 
-    # Builds the filter from a named grade preset, with optional overrides.
-    # @params grade: one of vf / f / vg / g / ag
-    # @output configured SilverWearFilter
+    # grade preset, with optional per-call overrides
     @classmethod
-    def for_grade(cls, grade: str, **overrides):
-        config = dict(cls._GRADES[grade])
-        config.update(overrides)
-        return cls(**config)
+    def for_grade(cls, grade, **overrides):
+        cfg = dict(cls._GRADES[grade])
+        cfg.update(overrides)
+        return cls(**cfg)
 
-    # Wears the coin down and re-lights it.
+    # Wears the coin and relights it.
     # @params image: float RGB image in [0, 1]
-    # @params coin_mask: float mask of coin pixels
-    # @params seed: seed shared by the sanding and relighting randomness
+    # @params coin_mask: float mask of the coin pixels
+    # @params seed: seed shared by the sanding and the relight randomness
     # @output DamageResult carrying the sanding wear mask
     def apply(self, image, coin_mask, seed=None) -> DamageResult:
         img = image.astype(np.float32)
         inside = coin_mask > 0.5
         cm = coin_mask[..., None]
-        if inside.any():
-            original_mean = float(relight._lum(img)[inside].mean())
-        else:
-            original_mean = 0.5
+
+        # remember the starting brightness so relighting can restore it
+        m0 = float(relight._lum(img)[inside].mean()) if inside.any() else 0.5
 
         sanded = ClassicSandingFilter.for_grade(self.grade).apply(image, coin_mask,
                                                                   seed=seed)
 
+        # offset the seed so the shine grain doesn't line up with the wear
         rng = np.random.default_rng(None if seed is None else seed + 101)
         out, light, spec = relight.silverize_and_shine(
             sanded.image, img, inside, light=self.light,
@@ -75,8 +71,7 @@ class SilverWearFilter(DamageFilter):
             shininess=self.shininess, gate_pct=self.gate_pct,
             fine_amt=self.fine_amt, brightness_bias=self.brightness_bias,
             spec_grain=self.spec_grain, rng=rng)
-        out = relight.reduce_big_shadows(out, original_mean, inside,
-                                         lift=self.shadow_lift)
+        out = relight.reduce_big_shadows(out, m0, inside, lift=self.shadow_lift)
 
         out = np.clip(out * cm + image * (1.0 - cm), 0.0, 1.0).astype(np.float32)
         params = dict(filter="silver_wear", seed=seed, grade=self.grade,

@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import argparse
 import csv
 import hashlib
@@ -45,67 +43,57 @@ META_COLUMNS = [
 _WORKER_CFG = {}
 
 
-# Draws chip parameters independently of the sanding grade, as chips on real
-# coins do not correlate with wear.
-# @params rng: numpy random generator
+# Chip parameters, drawn independently of the sanding grade (the professor's
+# point: a well-kept coin can still have a nicked rim).
+# @params rng: numpy generator
 # @output dict of ChipFilter overrides, or None for a chip-free coin
 def sample_chip_params(rng):
     if rng.random() < CHIP_NONE_PROB:
         return None
 
-    params = {}
-    for name, (low, high) in CHIP_RANGES.items():
-        params[name] = float(rng.uniform(low, high))
-
-    if rng.random() < BIG_CLIP_PROB:
-        params["big_chip_prob"] = 1.0
-    else:
-        params["big_chip_prob"] = 0.0
-
+    params = {name: float(rng.uniform(lo, hi)) for name, (lo, hi) in CHIP_RANGES.items()}
+    params["big_chip_prob"] = 1.0 if rng.random() < BIG_CLIP_PROB else 0.0
     return params
 
 
-# Applies grade-based sanding wear and then independently sampled rim chips
-# to a single coin face.
+# Wears one face down at the given grade, then adds independently sampled rim
+# chips on top.
 # @params image: float RGB face crop in [0, 1]
-# @params coin_mask: float mask marking coin pixels
+# @params coin_mask: float mask of the coin pixels
 # @params sand_grade: one of SAND_GRADES
 # @params seed: seed for this damage variant
 # @output (damaged image, metadata record)
 def damage_face(image, coin_mask, sand_grade, seed):
     rng = np.random.default_rng(seed)
     worn = SilverWearFilter.for_grade(sand_grade).apply(image, coin_mask, seed=seed)
-    chip_params = sample_chip_params(rng)
+    chips = sample_chip_params(rng)
 
     record = {
         "sand_grade": sand_grade,
         "seed": seed,
-        "has_chips": chip_params is not None,
+        "has_chips": chips is not None,
         "chip_amplitude": np.nan,
         "chip_threshold": np.nan,
         "chip_waviness": np.nan,
         "big_clip": False,
         "n_big_chips": 0,
     }
-
-    if chip_params is None:
+    if chips is None:
         return worn.image, record
 
-    chipped = ChipFilter(**chip_params).apply(worn.image, worn.coin_mask, seed=seed + 1)
-    big_chips = chipped.params.get("big_chips") or []
-
-    record["chip_amplitude"] = round(chip_params["amplitude"], 4)
-    record["chip_threshold"] = round(chip_params["threshold"], 4)
-    record["chip_waviness"] = round(chip_params["waviness"], 4)
-    record["big_clip"] = chip_params["big_chip_prob"] > 0
-    record["n_big_chips"] = len(big_chips)
-
-    return chipped.image, record
+    res = ChipFilter(**chips).apply(worn.image, worn.coin_mask, seed=seed + 1)
+    big = res.params.get("big_chips") or []
+    record["chip_amplitude"] = round(chips["amplitude"], 4)
+    record["chip_threshold"] = round(chips["threshold"], 4)
+    record["chip_waviness"] = round(chips["waviness"], 4)
+    record["big_clip"] = chips["big_chip_prob"] > 0
+    record["n_big_chips"] = len(big)
+    return res.image, record
 
 
-# Assigns a coin to train/val/test by hashing its id, so adding more coins
-# later never moves an existing coin between splits.
-# @params coin_id: filename stem of the coin scan
+# Hashes a coin id into a split. Doing it by hash rather than shuffling means
+# adding more coins later never shuffles an existing one into a different split.
+# @params coin_id: filename stem of the scan
 # @output "train", "val" or "test"
 def stable_split(coin_id):
     bucket = int(hashlib.md5(coin_id.encode()).hexdigest(), 16) % 100
@@ -116,67 +104,56 @@ def stable_split(coin_id):
     return "test"
 
 
-# Derives a reproducible seed from any mix of identifiers.
-# @params parts: values that identify one damage variant
-# @output 32-bit integer seed
+# reproducible per-variant seed from whatever identifiers you pass
 def stable_seed(*parts):
-    key = "_".join(str(part) for part in parts)
+    key = "_".join(str(p) for p in parts)
     return int(hashlib.md5(key.encode()).hexdigest()[:8], 16)
 
 
-# Pads an array to a square canvas and resizes it to the target resolution.
+# Pads an image (or mask) onto a square canvas and resizes to res. The fill is
+# white for images, black for masks, so nothing bleeds in from the padding.
 # @params img: float image or mask in [0, 1]
-# @params res: output side length in pixels
-# @params fill: padding value (white for images, black for masks)
+# @params res: output side in pixels
+# @params fill: padding value
 # @params resample: PIL resampling filter
-# @output uint8 array of shape (res, res[, 3])
+# @output uint8 array, (res, res[, 3])
 def to_square(img, res, fill, resample):
-    height, width = img.shape[:2]
-    side = max(height, width)
-
+    h, w = img.shape[:2]
+    side = max(h, w)
     if img.ndim == 3:
         canvas = np.full((side, side, img.shape[2]), fill, dtype=np.float32)
     else:
         canvas = np.full((side, side), fill, dtype=np.float32)
 
-    top = (side - height) // 2
-    left = (side - width) // 2
-    canvas[top:top + height, left:left + width] = img
-
-    as_uint8 = (np.clip(canvas, 0, 1) * 255).astype(np.uint8)
-    return np.asarray(Image.fromarray(as_uint8).resize((res, res), resample))
+    y0, x0 = (side - h) // 2, (side - w) // 2
+    canvas[y0:y0 + h, x0:x0 + w] = img
+    out = (np.clip(canvas, 0, 1) * 255).astype(np.uint8)
+    return np.asarray(Image.fromarray(out).resize((res, res), resample))
 
 
-# Saves a float image as a square JPEG on a white background.
-# @params arr01: float RGB image in [0, 1]
-# @params path: destination file
-# @params res: output resolution
+# save a float image as a square JPEG on white
 def save_jpg(arr01, path, res):
-    squared = to_square(arr01, res, fill=1.0, resample=Image.LANCZOS)
-    Image.fromarray(squared).save(path, quality=95)
+    out = to_square(arr01, res, fill=1.0, resample=Image.LANCZOS)
+    Image.fromarray(out).save(path, quality=95)
 
 
-# Saves a coin mask as a square binary PNG.
-# @params mask: float mask in [0, 1]
-# @params path: destination file
-# @params res: output resolution
+# save a coin mask as a square binary PNG
 def save_mask(mask, path, res):
-    squared = to_square(mask, res, fill=0.0, resample=Image.BILINEAR)
-    binary = ((squared > 127) * 255).astype(np.uint8)
-    Image.fromarray(binary).save(path)
+    out = to_square(mask, res, fill=0.0, resample=Image.BILINEAR)
+    Image.fromarray(((out > 127) * 255).astype(np.uint8)).save(path)
 
 
-# Receives the shared config in each worker process of the generation pool.
-# @params cfg: dict with the output directory and resolution
+# hands the shared config to each worker in the generation pool
 def _init_worker(cfg):
     global _WORKER_CFG
     _WORKER_CFG = cfg
 
 
-# Processes one coin scan inside a worker: segments both faces, saves the
-# clean target and mask, and renders all four damage grades per face.
+# One coin scan, start to finish, inside a worker: segment the faces, save the
+# clean target and its mask, then render all four damage grades. Runs in a pool
+# so it has to catch its own errors and report them back rather than crash.
 # @params jpg_path_str: path to the source scan
-# @output ("ok", coin_id, metadata rows) or ("error", coin_id, message)
+# @output ("ok", coin_id, rows) or ("error", coin_id, message)
 def _process_coin(jpg_path_str):
     out = Path(_WORKER_CFG["out"])
     res = _WORKER_CFG["res"]
@@ -190,28 +167,27 @@ def _process_coin(jpg_path_str):
         if not faces:
             return "error", coin_id, "no faces found"
 
+        # a stray blob or two can slip through; keep the two biggest, left first
         if len(faces) > 2:
             faces = sorted(faces, key=lambda f: f.coin_mask.sum(), reverse=True)[:2]
             faces = sorted(faces, key=lambda f: f.bbox[0])
 
         rows = []
-        for face_idx, face in enumerate(faces):
-            clean_rel = f"{split}/clean/{coin_id}_{face_idx}.jpg"
-            mask_rel = f"{split}/masks/{coin_id}_{face_idx}.png"
+        for fi, face in enumerate(faces):
+            clean_rel = f"{split}/clean/{coin_id}_{fi}.jpg"
+            mask_rel = f"{split}/masks/{coin_id}_{fi}.png"
             save_jpg(face.image, out / clean_rel, res)
             save_mask(face.coin_mask, out / mask_rel, res)
 
             for grade in SAND_GRADES:
-                seed = stable_seed(coin_id, face_idx, grade)
+                seed = stable_seed(coin_id, fi, grade)
                 damaged, record = damage_face(face.image, face.coin_mask, grade, seed)
-                damaged_rel = f"{split}/damaged/{coin_id}_{face_idx}_{grade}.jpg"
-                save_jpg(damaged, out / damaged_rel, res)
+                dmg_rel = f"{split}/damaged/{coin_id}_{fi}_{grade}.jpg"
+                save_jpg(damaged, out / dmg_rel, res)
 
-                row = dict(record)
-                row.update(coin_id=coin_id, face=face_idx, split=split,
-                           n_faces=len(faces), clean_path=clean_rel,
-                           mask_path=mask_rel, damaged_path=damaged_rel)
-                rows.append(row)
+                rows.append(dict(record, coin_id=coin_id, face=fi, split=split,
+                                 n_faces=len(faces), clean_path=clean_rel,
+                                 mask_path=mask_rel, damaged_path=dmg_rel))
 
         return "ok", coin_id, rows
 
@@ -219,14 +195,12 @@ def _process_coin(jpg_path_str):
         return "error", coin_id, f"{type(exc).__name__}: {exc}"
 
 
-# Renders a quick visual check: one row per face showing the clean image
-# next to its four damage grades.
-# @params out: dataset root containing the saved images
+# A quick eyeball sheet: one row per face, clean image beside its four grades.
+# @params out: dataset root with the saved images
 # @params rows: metadata rows to draw from
-# @params n_faces: how many faces to include
+# @params n_faces: how many faces to show
 def make_contact_sheet(out, rows, n_faces=6):
-    groups = []
-    seen = set()
+    groups, seen = [], set()
     for row in rows:
         key = (row["coin_id"], row["face"])
         if key not in seen:
@@ -238,20 +212,20 @@ def make_contact_sheet(out, rows, n_faces=6):
     cells = []
     for coin_id, face in groups:
         face_rows = [r for r in rows if (r["coin_id"], r["face"]) == (coin_id, face)]
-        images = [Image.open(out / face_rows[0]["clean_path"])]
+        imgs = [Image.open(out / face_rows[0]["clean_path"])]
         for grade in SAND_GRADES:
             match = next(r for r in face_rows if r["sand_grade"] == grade)
-            images.append(Image.open(out / match["damaged_path"]))
-        cells.append(images)
+            imgs.append(Image.open(out / match["damaged_path"]))
+        cells.append(imgs)
 
     if not cells:
         return
 
-    cell_size = cells[0][0].width
-    sheet = Image.new("RGB", (cell_size * 5, cell_size * len(cells)), (255, 255, 255))
-    for row_idx, images in enumerate(cells):
-        for col_idx, image in enumerate(images):
-            sheet.paste(image, (col_idx * cell_size, row_idx * cell_size))
+    cw = cells[0][0].width
+    sheet = Image.new("RGB", (cw * 5, cw * len(cells)), (255, 255, 255))
+    for r, imgs in enumerate(cells):
+        for c, img in enumerate(imgs):
+            sheet.paste(img, (c * cw, r * cw))
     sheet.save(out / "contact_sheet.png")
 
 
@@ -650,7 +624,8 @@ class CoinRestorationPipeline:
     # settings without touching the main config.
     # @params override_split / override_limit / override_guidance /
     #         override_out / override_tar / override_samples: one-off settings
-    # @output results folder with restored/, triptychs/, fans/, results_metadata.csv
+    # @output results folder: flat restored/+triptychs/ for one draw, or one
+    #         by_coin/<coin>/ subfolder per image (samples + triptych + fan)
     def infer(self, override_split=None, override_limit=None,
               override_guidance=None, override_out=None, override_tar=None,
               override_samples=None):
@@ -665,16 +640,21 @@ class CoinRestorationPipeline:
         guidance = override_guidance if override_guidance is not None else cfg.guidance
         make_tar = override_tar if override_tar is not None else cfg.results_tar
         n_samples = override_samples if override_samples is not None else cfg.num_samples
-        (out / "restored").mkdir(parents=True, exist_ok=True)
-        (out / "triptychs").mkdir(exist_ok=True)
-        if n_samples > 1:
-            (out / "fans").mkdir(exist_ok=True)
+
+        # With one draw the output stays flat; with several, each coin gets its
+        # own subfolder holding all its samples, its triptych and its fan.
+        multi = n_samples > 1
+        if not multi:
+            (out / "restored").mkdir(parents=True, exist_ok=True)
+            (out / "triptychs").mkdir(exist_ok=True)
+        else:
+            (out / "by_coin").mkdir(parents=True, exist_ok=True)
 
         model_path = cfg.model or str(Path(cfg.output_dir) / "final")
         rows = self._metadata_rows(split)
         if limit:
             rows = rows[:limit]
-        print(f"{len(rows)} {split} samples x {n_samples} draws, "
+        print(f"{len(rows)} {split} images x {n_samples} draws, "
               f"model: {model_path}, guidance {guidance}")
 
         pipe = DiffusionPipeline.from_pretrained(model_path,
@@ -701,32 +681,36 @@ class CoinRestorationPipeline:
 
             for (row, k), damaged_img, restored in zip(chunk, damaged, restored_batch):
                 base = f"{row['coin_id']}_{row['face']}_{row['sand_grade']}"
-                stem = f"{base}_s{k}" if n_samples > 1 else base
-                restored_rel = f"restored/{stem}.png"
+                if multi:
+                    coin_dir = out / "by_coin" / base
+                    coin_dir.mkdir(exist_ok=True)
+                    restored_rel = f"by_coin/{base}/sample_{k}.png"
+                    triptych_rel = f"by_coin/{base}/triptych.jpg"
+                    fan_rel = f"by_coin/{base}/fan.jpg"
+                else:
+                    restored_rel = f"restored/{base}.png"
+                    triptych_rel = f"triptychs/{base}.jpg"
                 restored.save(out / restored_rel)
 
                 record = dict(row, sample_idx=k, restored_path=restored_rel,
-                              triptych_path="", steps=cfg.steps,
+                              triptych_path=triptych_rel, steps=cfg.steps,
                               image_guidance=cfg.image_guidance,
                               guidance=guidance, model=model_path)
 
+                clean = Image.open(data / row["clean_path"]).convert("RGB")
                 if k == 0:
-                    clean = Image.open(data / row["clean_path"]).convert("RGB")
                     width, height = restored.size
                     triptych = Image.new("RGB", (width * 3, height), (255, 255, 255))
                     triptych.paste(damaged_img.resize((width, height)), (0, 0))
                     triptych.paste(restored, (width, 0))
                     triptych.paste(clean.resize((width, height)), (width * 2, 0))
-                    record["triptych_path"] = f"triptychs/{base}.jpg"
-                    triptych.save(out / record["triptych_path"], quality=92)
+                    triptych.save(out / triptych_rel, quality=92)
 
-                if n_samples > 1:
+                if multi:
                     fan = pending_fans.setdefault(base, [None] * n_samples)
                     fan[k] = restored
-                    if all(fan):
-                        self._save_fan(out / "fans" / f"{base}.jpg",
-                                       damaged_img, fan,
-                                       Image.open(data / row["clean_path"]).convert("RGB"))
+                    if all(f is not None for f in fan):
+                        self._save_fan(out / fan_rel, damaged_img, fan, clean)
                         del pending_fans[base]
 
                 results.append(record)
@@ -743,6 +727,16 @@ class CoinRestorationPipeline:
                 tar.add(out, arcname=out.name)
             print(f"-> {tar_path} ({tar_path.stat().st_size / 1e9:.2f} GB)")
 
+    # Pastes a row of images into one strip and saves it.
+    # @params path: destination jpg
+    # @params images: PIL images, laid out left to right
+    def _save_strip(self, path, *images):
+        width, height = images[0].size
+        strip = Image.new("RGB", (width * len(images), height), (255, 255, 255))
+        for i, cell in enumerate(images):
+            strip.paste(cell.resize((width, height)), (i * width, 0))
+        strip.save(path, quality=90)
+
     # Lays out one image's sample fan: the damaged input, every drawn
     # restoration, and the clean target in a single row.
     # @params path: destination jpg
@@ -750,13 +744,7 @@ class CoinRestorationPipeline:
     # @params samples: list of restored PIL images
     # @params clean: the ground-truth image
     def _save_fan(self, path, damaged_img, samples, clean):
-        width, height = samples[0].size
-        cells = [damaged_img.resize((width, height))] + samples \
-            + [clean.resize((width, height))]
-        strip = Image.new("RGB", (width * len(cells), height), (255, 255, 255))
-        for i, cell in enumerate(cells):
-            strip.paste(cell, (i * width, 0))
-        strip.save(path, quality=90)
+        self._save_strip(path, damaged_img, *samples, clean)
 
     # Scores the downloaded results against the clean targets with masked
     # PSNR / SSIM / LPIPS, grouped by the damage state each image came from.
@@ -834,9 +822,18 @@ class CoinRestorationPipeline:
                 if key in best_of:
                     print(f"  {key}: {best_of[key]}")
 
-        fid = None if cfg.no_fid else self._compute_fid()
-        self._make_plots(full, results)
-        self._write_report(full, by_grade, by_chip, by_clip, fid, best_of, results)
+        fid = None if cfg.no_fid else self._compute_fid(full)
+
+        multi = best_of is not None
+        if multi:
+            self._make_plots(self._collapse_per_image(full, "best"), results,
+                             "plots/best")
+            self._make_plots(self._collapse_per_image(full, "average"), results,
+                             "plots/average")
+        else:
+            self._make_plots(full, results, "plots")
+        self._write_report(full, by_grade, by_chip, by_clip, fid, best_of,
+                           multi, results)
 
         print(f"\n-> {results / 'results_per_image.csv'}")
         print(f"-> {results / 'results_summary.csv'}")
@@ -864,40 +861,72 @@ class CoinRestorationPipeline:
 
     # Computes distribution-level FID: restored vs clean, plus the damaged vs
     # clean baseline that shows how far restoration moved the distribution.
+    # Gathers restored images from the metadata so it works whether they sit
+    # in a flat folder or in per-coin subfolders.
+    # @params full: per-image dataframe with the restored_path column
     # @output dict with both scores, or None when pytorch-fid is missing
-    def _compute_fid(self):
+    def _compute_fid(self, full):
         try:
             from pytorch_fid import fid_score
         except ImportError:
             print("pytorch-fid not installed, skipping FID (pip install pytorch-fid)")
             return None
 
+        import tempfile
         cfg = self.cfg
         clean_dir = str(Path(cfg.data) / "test" / "clean")
         damaged_dir = str(Path(cfg.data) / "test" / "damaged")
-        restored_dir = str(Path(cfg.results) / "restored")
 
-        print("computing FID (restored vs clean)")
-        fid_restored = fid_score.calculate_fid_given_paths(
-            [restored_dir, clean_dir], batch_size=32, device=cfg.device, dims=2048)
-        print("computing FID baseline (damaged vs clean)")
-        fid_damaged = fid_score.calculate_fid_given_paths(
-            [damaged_dir, clean_dir], batch_size=32, device=cfg.device, dims=2048)
+        # A flat directory of all restored images, with unique names, that FID
+        # can scan regardless of the on-disk layout.
+        flat = Path(tempfile.mkdtemp(prefix="fid_restored_"))
+        for rel in full["restored_path"]:
+            src = (Path(cfg.results) / rel).resolve()
+            (flat / rel.replace("/", "_")).symlink_to(src)
+
+        try:
+            print("computing FID (restored vs clean)")
+            fid_restored = fid_score.calculate_fid_given_paths(
+                [str(flat), clean_dir], batch_size=32, device=cfg.device, dims=2048)
+            print("computing FID baseline (damaged vs clean)")
+            fid_damaged = fid_score.calculate_fid_given_paths(
+                [damaged_dir, clean_dir], batch_size=32, device=cfg.device, dims=2048)
+        finally:
+            shutil.rmtree(flat)
 
         print(f"FID restored: {fid_restored:.2f}   FID damaged: {fid_damaged:.2f}")
         return {"restored": fid_restored, "damaged": fid_damaged}
 
+    # Collapses several samples per image down to one row each, so the plots
+    # can show either the best draw or the average draw.
+    # @params full: per-image, per-sample dataframe
+    # @params how: "best" (oracle per metric) or "average" (mean over draws)
+    # @output one-row-per-image dataframe
+    def _collapse_per_image(self, full, how):
+        keys = ["coin_id", "face", "sand_grade"]
+        best_dir = {"psnr": "max", "ssim": "max", "lpips": "min",
+                    "psnr_unmasked": "max", "psnr_damaged": "mean",
+                    "lpips_damaged": "mean"}
+        agg = {}
+        for col in full.columns:
+            if col in best_dir:
+                agg[col] = best_dir[col] if how == "best" else "mean"
+            elif col in ("chip_bin", "big_clip"):
+                agg[col] = "first"
+        return full.groupby(keys, as_index=False).agg(agg)
+
     # Draws the evaluation figures: metrics by damage state, the per-image
     # improvement scatter, metric distributions, and the training loss curve.
     # @params full: per-image dataframe with metric columns
-    # @params results: results folder; figures land in results/plots
-    def _make_plots(self, full, results):
+    # @params results: results folder
+    # @params subdir: where the figures land, e.g. "plots" or "plots/best"
+    def _make_plots(self, full, results, subdir):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        plots = Path(results) / "plots"
-        plots.mkdir(exist_ok=True)
+        plots = Path(results) / subdir
+        plots.mkdir(parents=True, exist_ok=True)
 
         restored_color = "#2a78d6"
         damaged_color = "#8a8983"
@@ -1014,8 +1043,10 @@ class CoinRestorationPipeline:
     # @params by_grade / by_chip / by_clip: grouped summary tables
     # @params fid: FID scores dict or None
     # @params best_of: best-of-N sample stats dict or None
+    # @params multi: whether several samples were drawn per image
     # @params results: results folder
-    def _write_report(self, full, by_grade, by_chip, by_clip, fid, best_of, results):
+    def _write_report(self, full, by_grade, by_chip, by_clip, fid, best_of,
+                      multi, results):
         def stat(column):
             if column not in full.columns:
                 return "n/a"
@@ -1067,25 +1098,35 @@ class CoinRestorationPipeline:
         lines.append("")
         lines.append("- `results_per_image.csv` — every metric for every image")
         lines.append("- `results_summary.csv` — the grouped tables above")
-        lines.append("- `plots/metrics_by_grade.png`, `plots/metrics_by_chip.png` "
-                     "— restored vs damaged by damage state")
-        lines.append("- `plots/lpips_improvement.png` — per-image before/after")
-        lines.append("- `plots/distributions.png` — metric histograms")
+        if multi:
+            lines.append("- `plots/best/` — figures using each image's best draw")
+            lines.append("- `plots/average/` — figures using the mean over draws")
+            lines.append("- `by_coin/<coin>/` — every sample, triptych and fan "
+                         "strip for each coin")
+        else:
+            lines.append("- `plots/metrics_by_grade.png`, `plots/metrics_by_chip.png` "
+                         "— restored vs damaged by damage state")
+            lines.append("- `plots/lpips_improvement.png` — per-image before/after")
+            lines.append("- `plots/distributions.png` — metric histograms")
         if self.cfg.train_log and Path(self.cfg.train_log).exists():
-            lines.append("- `plots/training_loss.png` — smoothed loss curve")
+            base = "plots/best" if multi else "plots"
+            lines.append(f"- `{base}/training_loss.png` — smoothed loss curve")
 
         (Path(results) / "results_report.md").write_text("\n".join(lines) + "\n")
 
-    # Restores arbitrary coin images with a saved model; the entry point for
-    # using the model after the project.
-    # @output restored PNGs in cfg.results
+    # Restores arbitrary coin images (e.g. a folder of scans) with a saved
+    # model. With --num-samples above 1 each coin gets its own subfolder
+    # holding every drawn restoration plus a fan strip (input | samples).
+    # @output restored PNGs in cfg.results, one subfolder per coin when multi
     def restore(self):
         import torch
         from diffusers import DiffusionPipeline
 
         cfg = self.cfg
         device, dtype = self._pick_device()
-        print(f"device={device} dtype={dtype}")
+        n_samples = cfg.num_samples
+        multi = n_samples > 1
+        print(f"device={device} dtype={dtype}, {n_samples} draws per coin")
 
         pipe = DiffusionPipeline.from_pretrained(cfg.model, torch_dtype=dtype).to(device)
 
@@ -1099,18 +1140,28 @@ class CoinRestorationPipeline:
         out = Path(cfg.results)
         out.mkdir(parents=True, exist_ok=True)
 
-        for path in paths:
+        for path in tqdm(paths, desc="restoring", unit="coin"):
             for suffix, img in self._input_faces(path):
-                generator = torch.Generator(device).manual_seed(cfg.seed)
-                restored = pipe(PROMPT, image=img,
-                                height=cfg.resolution, width=cfg.resolution,
-                                num_inference_steps=cfg.steps,
-                                image_guidance_scale=cfg.image_guidance,
-                                guidance_scale=cfg.guidance,
-                                generator=generator).images[0]
-                destination = out / f"{path.stem}{suffix}_restored.png"
-                restored.save(destination)
-                print(f"-> {destination}")
+                name = f"{path.stem}{suffix}"
+                samples = []
+                for k in range(n_samples):
+                    generator = torch.Generator(device).manual_seed(cfg.seed + 9973 * k)
+                    restored = pipe(PROMPT, image=img,
+                                    height=cfg.resolution, width=cfg.resolution,
+                                    num_inference_steps=cfg.steps,
+                                    image_guidance_scale=cfg.image_guidance,
+                                    guidance_scale=cfg.guidance,
+                                    generator=generator).images[0]
+                    samples.append(restored)
+
+                if multi:
+                    coin_dir = out / name
+                    coin_dir.mkdir(exist_ok=True)
+                    for k, restored in enumerate(samples):
+                        restored.save(coin_dir / f"sample_{k}.png")
+                    self._save_strip(coin_dir / "fan.jpg", img, *samples)
+                else:
+                    samples[0].save(out / f"{name}_restored.png")
 
     # Prints a stage banner so the pipeline output is easy to scan.
     # @params idx: stage number
@@ -1520,6 +1571,9 @@ def parse_args():
     restore.add_argument("--image-guidance", type=float, default=1.5)
     restore.add_argument("--guidance", type=float, default=6.0)
     restore.add_argument("--segment", action="store_true")
+    restore.add_argument("--num-samples", type=int, default=1,
+                         help="restorations drawn per coin; above 1 writes one "
+                              "subfolder per coin with all samples and a fan")
 
     run.add_argument("--skip-smoke", action="store_true",
                      help="skip the automatic smoke validation before the full run")

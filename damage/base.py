@@ -1,17 +1,15 @@
-from __future__ import annotations
-
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
 import numpy as np
 
 
-# Carries the output of one damage filter: the modified image, a soft mask of
-# where damage was applied, and the (possibly shrunken) coin silhouette.
+# What a filter hands back: the altered image, a soft map of where the damage
+# landed, and the coin silhouette (chipping can eat into it).
 # @params image: float RGB image in [0, 1]
 # @params damage_mask: float map in [0, 1], 1 = fully damaged
-# @params coin_mask: float mask of the coin after this filter
-# @params params: settings the filter used, for logging
+# @params coin_mask: the coin mask after this filter ran
+# @params params: the settings that were used, kept for logging
 @dataclass
 class DamageResult:
     image: np.ndarray
@@ -20,15 +18,13 @@ class DamageResult:
     params: dict = field(default_factory=dict)
 
 
-# Base class for damage filters so they can be chained: each takes an image
-# plus coin mask and returns a DamageResult.
+# Shared base so the filters can be stacked one after another.
 class DamageFilter(ABC):
 
-    # Applies the filter to one coin face.
     # @params image: float RGB image in [0, 1]
-    # @params coin_mask: float mask of coin pixels
-    # @params seed: optional seed for reproducible randomness
-    # @output DamageResult
+    # @params coin_mask: float mask of the coin pixels
+    # @params seed: seed for reproducible randomness, or None
+    # @output a DamageResult
     @abstractmethod
-    def apply(self, image: np.ndarray, coin_mask: np.ndarray,
-              seed: int | None = None) -> DamageResult: ...
+    def apply(self, image, coin_mask, seed=None) -> DamageResult:
+        ...

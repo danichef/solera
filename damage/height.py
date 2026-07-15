@@ -1,22 +1,20 @@
-from __future__ import annotations
-
 import numpy as np
 from scipy import ndimage
 
 
-# Estimates a relief height map from a single photo. There is no real depth
-# data, so brightness relative to the local neighbourhood stands in for
-# height: raised detail catches the light and reads brighter than the metal
-# right next to it, even when the whole region is in shadow.
+# Fakes a relief height map from a single photo. We have no real depth, so we
+# lean on a simple fact: raised detail catches the light and reads brighter
+# than the metal right next to it, even when the whole area sits in shadow.
+# Subtracting a blurred copy of the luminance cancels the lighting and leaves
+# roughly the relief.
 class SignedRelief:
 
-    # @params field_sigma: blur radius that defines the "local lighting field"
-    # @params blur_sigma: small denoise blur before anything else
+    # @params field_sigma: blur radius that stands in for the local lighting
+    # @params blur_sigma: tiny denoise blur before anything else
     # @params broaden_sigma: blur that spreads the estimate over whole features
     # @params lo_pct / hi_pct: percentiles mapped to height 0 and 1
-    def __init__(self, field_sigma: float = 20.0, blur_sigma: float = 1.0,
-                 broaden_sigma: float = 2.0,
-                 lo_pct: float = 4.0, hi_pct: float = 99.0):
+    def __init__(self, field_sigma=20.0, blur_sigma=1.0, broaden_sigma=2.0,
+                 lo_pct=4.0, hi_pct=99.0):
         self.field_sigma = field_sigma
         self.blur_sigma = blur_sigma
         self.broaden_sigma = broaden_sigma
@@ -25,7 +23,7 @@ class SignedRelief:
 
     # Builds the height map for one face.
     # @params image: float RGB image in [0, 1]
-    # @params coin_mask: float mask of coin pixels
+    # @params coin_mask: float mask of the coin pixels
     # @output float height map in [0, 1], zero outside the coin
     def estimate(self, image, coin_mask):
         lum = 0.299 * image[..., 0] + 0.587 * image[..., 1] + 0.114 * image[..., 2]
@@ -42,5 +40,5 @@ class SignedRelief:
 
         lo = np.percentile(relief[inside], self.lo_pct)
         hi = np.percentile(relief[inside], self.hi_pct)
-        height = np.clip((relief - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
-        return (height * coin_mask).astype(np.float32)
+        h = np.clip((relief - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+        return (h * coin_mask).astype(np.float32)

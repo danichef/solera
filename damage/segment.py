@@ -1,13 +1,10 @@
-from __future__ import annotations
-
 from dataclasses import dataclass
 
 import numpy as np
 from scipy import ndimage
 
 
-# One coin face cut out of a scan: the cropped image, its coin mask, the crop
-# box in the original scan, and a name for output files.
+# A single coin face cut out of a scan.
 @dataclass
 class Face:
     image: np.ndarray
@@ -16,40 +13,38 @@ class Face:
     name: str
 
 
-# Finds the coin faces in a scan photographed on a white background. Everything
-# darker than the cutoff is foreground; connected blobs above the minimum area
-# become faces, ordered left to right.
+# Pulls the coin faces out of a scan shot on a white background. Anything
+# darker than the cutoff counts as foreground; blobs big enough to matter
+# become faces, handed back left to right.
 # @params rgb_uint8: the scan as a uint8 RGB array
-# @params white_cutoff: gray level above which a pixel counts as background
+# @params white_cutoff: grey level above which a pixel is background
 # @params min_area_frac: smallest blob to keep, as a fraction of the image
-# @output list of Face objects, left to right
-def segment_faces(rgb_uint8: np.ndarray,
-                  white_cutoff: int = 250,
-                  min_area_frac: float = 0.02) -> list[Face]:
-    gray = rgb_uint8.mean(axis=2)
-    foreground = ndimage.binary_fill_holes(gray < white_cutoff)
+# @output list of Face objects, ordered left to right
+def segment_faces(rgb_uint8, white_cutoff=250, min_area_frac=0.02):
+    grey = rgb_uint8.mean(axis=2)
+    fg = ndimage.binary_fill_holes(grey < white_cutoff)
 
-    labels, count = ndimage.label(foreground)
-    if count == 0:
+    labels, n = ndimage.label(fg)
+    if n == 0:
         return []
 
-    areas = ndimage.sum(np.ones_like(labels), labels, range(1, count + 1))
-    min_area = min_area_frac * foreground.size
-    keep = [i + 1 for i, area in enumerate(areas) if area >= min_area]
+    areas = ndimage.sum(np.ones_like(labels), labels, range(1, n + 1))
+    min_area = min_area_frac * fg.size
+    keep = [i + 1 for i, a in enumerate(areas) if a >= min_area]
 
     def left_edge(label):
         return np.where(labels == label)[1].min()
 
     faces = []
-    for index, label in enumerate(sorted(keep, key=left_edge)):
-        component = labels == label
-        ys, xs = np.where(component)
+    for i, label in enumerate(sorted(keep, key=left_edge)):
+        blob = labels == label
+        ys, xs = np.where(blob)
         x0, x1 = xs.min(), xs.max() + 1
         y0, y1 = ys.min(), ys.max() + 1
         faces.append(Face(
             image=rgb_uint8[y0:y1, x0:x1].astype(np.float32) / 255.0,
-            coin_mask=component[y0:y1, x0:x1].astype(np.float32),
+            coin_mask=blob[y0:y1, x0:x1].astype(np.float32),
             bbox=(x0, y0, x1, y1),
-            name=f"face{index}",
+            name=f"face{i}",
         ))
     return faces
