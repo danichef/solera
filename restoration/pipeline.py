@@ -159,7 +159,7 @@ def _process_coin(jpg_path_str):
     res = _WORKER_CFG["res"]
     jpg_path = Path(jpg_path_str)
     coin_id = jpg_path.stem
-    split = stable_split(coin_id)
+    split = _WORKER_CFG.get("force_split") or stable_split(coin_id)
 
     try:
         rgb = np.array(Image.open(jpg_path).convert("RGB"))
@@ -390,7 +390,8 @@ class CoinRestorationPipeline:
             for sub in ("clean", "masks", "damaged"):
                 (out / split / sub).mkdir(parents=True, exist_ok=True)
 
-        worker_cfg = {"out": str(out), "res": cfg.resolution}
+        worker_cfg = {"out": str(out), "res": cfg.resolution,
+                      "force_split": cfg.force_split}
         all_rows = []
         errors = []
 
@@ -1526,6 +1527,11 @@ def parse_args():
         p.add_argument("--workers", type=int, default=8)
         p.add_argument("--tar", action="store_true",
                        help="also pack the dataset into dataset.tar for upload")
+        p.add_argument("--force-split", default=None,
+                       choices=["train", "val", "test"],
+                       help="put every coin in this split instead of the "
+                            "hashed 80/10/10 assignment (e.g. to build a "
+                            "held-out test set from a folder of scans)")
 
     for p in (run, train):
         p.add_argument("--output-dir", default="/workspace/coin-restorer-xl")
