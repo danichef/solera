@@ -1129,6 +1129,8 @@ class CoinRestorationPipeline:
         print(f"device={device} dtype={dtype}, {n_samples} draws per coin")
 
         pipe = DiffusionPipeline.from_pretrained(cfg.model, torch_dtype=dtype).to(device)
+        pipe.set_progress_bar_config(disable=True)
+        pipe.enable_vae_slicing()
 
         source = Path(cfg.input)
         if source.is_dir():
@@ -1143,25 +1145,32 @@ class CoinRestorationPipeline:
         for path in tqdm(paths, desc="restoring", unit="coin"):
             for suffix, img in self._input_faces(path):
                 name = f"{path.stem}{suffix}"
-                samples = []
-                for k in range(n_samples):
-                    generator = torch.Generator(device).manual_seed(cfg.seed + 9973 * k)
-                    restored = pipe(PROMPT, image=img,
-                                    height=cfg.resolution, width=cfg.resolution,
-                                    num_inference_steps=cfg.steps,
-                                    image_guidance_scale=cfg.image_guidance,
-                                    guidance_scale=cfg.guidance,
-                                    generator=generator).images[0]
-                    samples.append(restored)
+                coin_dir = out / name
+                flat_png = out / f"{name}_restored.png"
+
+                # already done on a previous run, skip it
+                if multi and (coin_dir / "fan.jpg").exists():
+                    continue
+                if not multi and flat_png.exists():
+                    continue
+
+                # all draws in one batched call, one generator per seed
+                generators = [torch.Generator(device).manual_seed(cfg.seed + 9973 * k)
+                              for k in range(n_samples)]
+                samples = pipe([PROMPT] * n_samples, image=[img] * n_samples,
+                               height=cfg.resolution, width=cfg.resolution,
+                               num_inference_steps=cfg.steps,
+                               image_guidance_scale=cfg.image_guidance,
+                               guidance_scale=cfg.guidance,
+                               generator=generators).images
 
                 if multi:
-                    coin_dir = out / name
                     coin_dir.mkdir(exist_ok=True)
                     for k, restored in enumerate(samples):
                         restored.save(coin_dir / f"sample_{k}.png")
                     self._save_strip(coin_dir / "fan.jpg", img, *samples)
                 else:
-                    samples[0].save(out / f"{name}_restored.png")
+                    samples[0].save(flat_png)
 
     # Prints a stage banner so the pipeline output is easy to scan.
     # @params idx: stage number
