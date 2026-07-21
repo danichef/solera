@@ -43,8 +43,14 @@ python restoration/pipeline.py run --src <raw scans> --data <dataset dir> \
 ```
 
 Individual stages are available as subcommands (`prepare`, `train`, `infer`,
-`eval`, `restore`). The `restore` subcommand applies a trained model to any
-new image.
+`eval`, `restore`, `leakage`). The `restore` subcommand applies a trained
+model to any new image. The `leakage` subcommand matches every image in one
+folder against its nearest neighbour in another (e.g. test vs training
+scans) to check for dataset leakage; passing `--results <eval dir>` narrows
+it to the best, worst and middle coins by restoration score (mean over their
+generations) and adds per-tier montages plus a quality-vs-leakage scatter.
+`eval --replot` rebuilds all plots and reports from an existing
+`results_per_image.csv` without rescoring.
 
 ## Layout
 

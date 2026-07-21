@@ -25,6 +25,8 @@ VAE_MODEL = "madebyollin/sdxl-vae-fp16-fix"
 
 SAND_GRADES = ["f", "vg", "g", "ag"]
 
+IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff")
+
 CHIP_NONE_PROB = 0.20
 BIG_CLIP_PROB = 0.15
 CHIP_RANGES = {
@@ -759,42 +761,17 @@ class CoinRestorationPipeline:
         results = Path(cfg.results)
         res = cfg.resolution
 
-        df = pd.read_csv(results / "results_metadata.csv")
-        df["has_chips"] = df["has_chips"].astype(str).str.lower() == "true"
-        df["big_clip"] = df["big_clip"].astype(str).str.lower() == "true"
-        df["chip_bin"] = df.apply(self._chip_bin, axis=1)
-        print(f"{len(df)} results")
-
-        lpips_scorer = None
-        if not cfg.no_lpips:
-            try:
-                lpips_scorer = self._lpips_scorer(cfg.device)
-            except ImportError:
-                print("lpips not installed, skipping (pip install lpips torch)")
-
-        records = []
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="scoring", unit="img"):
-            clean = self._load01(data / row["clean_path"], res)
-            restored = self._load01(results / row["restored_path"], res)
-            damaged = self._load01(data / row["damaged_path"], res)
-            mask_img = Image.open(data / row["mask_path"]).convert("L")
-            mask = np.asarray(mask_img.resize((res, res), Image.BILINEAR),
-                              dtype=np.float32) / 255.0
-
-            record = {
-                "psnr": self._masked_psnr(clean, restored, mask),
-                "ssim": self._masked_ssim(clean, restored, mask, structural_similarity),
-                "psnr_unmasked": self._masked_psnr(clean, restored, np.ones_like(mask)),
-                "psnr_damaged": self._masked_psnr(clean, damaged, mask),
-            }
-            if lpips_scorer:
-                record["lpips"] = lpips_scorer(clean, restored, mask)
-                record["lpips_damaged"] = lpips_scorer(clean, damaged, mask)
-            records.append(record)
-
-        metrics = pd.DataFrame(records)
-        full = pd.concat([df, metrics], axis=1)
-        full.to_csv(results / "results_per_image.csv", index=False)
+        # --replot reuses the already scored csv, so plots and reports can be
+        # regenerated (or extended) without touching a single image again.
+        per_image_csv = results / "results_per_image.csv"
+        if cfg.replot and per_image_csv.exists():
+            full = pd.read_csv(per_image_csv)
+            for column in ("has_chips", "big_clip"):
+                full[column] = full[column].astype(str).str.lower() == "true"
+            print(f"replotting {len(full)} previously scored results")
+        else:
+            full = self._score_results(data, results, res, structural_similarity)
+            full.to_csv(per_image_csv, index=False)
 
         columns = [c for c in ("psnr", "ssim", "lpips", "psnr_damaged", "lpips_damaged")
                    if c in full.columns]
@@ -831,6 +808,7 @@ class CoinRestorationPipeline:
                              "plots/best")
             self._make_plots(self._collapse_per_image(full, "average"), results,
                              "plots/average")
+            self._make_generation_plots(full, results)
         else:
             self._make_plots(full, results, "plots")
         self._write_report(full, by_grade, by_chip, by_clip, fid, best_of,
@@ -840,6 +818,52 @@ class CoinRestorationPipeline:
         print(f"-> {results / 'results_summary.csv'}")
         print(f"-> {results / 'results_report.md'}")
         print(f"-> {results / 'plots/'}")
+
+    # Scores every restored image against its clean target with masked
+    # PSNR / SSIM / LPIPS, plus the damaged-input baseline.
+    # @params data: dataset folder
+    # @params results: results folder holding results_metadata.csv
+    # @params res: evaluation resolution
+    # @params structural_similarity: skimage ssim function
+    # @output per-image dataframe of metadata plus metric columns
+    def _score_results(self, data, results, res, structural_similarity):
+        import pandas as pd
+
+        cfg = self.cfg
+        df = pd.read_csv(results / "results_metadata.csv")
+        df["has_chips"] = df["has_chips"].astype(str).str.lower() == "true"
+        df["big_clip"] = df["big_clip"].astype(str).str.lower() == "true"
+        df["chip_bin"] = df.apply(self._chip_bin, axis=1)
+        print(f"{len(df)} results")
+
+        lpips_scorer = None
+        if not cfg.no_lpips:
+            try:
+                lpips_scorer = self._lpips_scorer(cfg.device)
+            except ImportError:
+                print("lpips not installed, skipping (pip install lpips torch)")
+
+        records = []
+        for _, row in tqdm(df.iterrows(), total=len(df), desc="scoring", unit="img"):
+            clean = self._load01(data / row["clean_path"], res)
+            restored = self._load01(results / row["restored_path"], res)
+            damaged = self._load01(data / row["damaged_path"], res)
+            mask_img = Image.open(data / row["mask_path"]).convert("L")
+            mask = np.asarray(mask_img.resize((res, res), Image.BILINEAR),
+                              dtype=np.float32) / 255.0
+
+            record = {
+                "psnr": self._masked_psnr(clean, restored, mask),
+                "ssim": self._masked_ssim(clean, restored, mask, structural_similarity),
+                "psnr_unmasked": self._masked_psnr(clean, restored, np.ones_like(mask)),
+                "psnr_damaged": self._masked_psnr(clean, damaged, mask),
+            }
+            if lpips_scorer:
+                record["lpips"] = lpips_scorer(clean, restored, mask)
+                record["lpips_damaged"] = lpips_scorer(clean, damaged, mask)
+            records.append(record)
+
+        return pd.concat([df, pd.DataFrame(records)], axis=1)
 
     # When several samples were drawn per image, reports the oracle score of
     # the best draw: how good the distribution's best answer is, per image,
@@ -1039,6 +1063,69 @@ class CoinRestorationPipeline:
             fig.savefig(plots / "training_loss.png", bbox_inches="tight")
             plt.close(fig)
 
+    # Draws the figures only a multi-draw run enables: the full metric
+    # distribution over every generation (not collapsed to best or mean),
+    # split by damage grade, and the per-image spread across draws, which
+    # shows how much the model's answers disagree for the same input.
+    # @params full: per-image, per-sample dataframe
+    # @params results: results folder
+    def _make_generation_plots(self, full, results):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        plots = Path(results) / "plots/generations"
+        plots.mkdir(parents=True, exist_ok=True)
+
+        grade_colors = {"f": "#2a78d6", "vg": "#1baf7a",
+                        "g": "#eda100", "ag": "#4a3aa7"}
+
+        def style(ax):
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.grid(axis="y", color="#e8e7e3", linewidth=0.8)
+            ax.set_axisbelow(True)
+
+        metric_titles = [("psnr", "PSNR (dB, higher better)"),
+                         ("ssim", "SSIM (higher better)"),
+                         ("lpips", "LPIPS (lower better)")]
+        metrics = [(m, t) for m, t in metric_titles if m in full.columns]
+        grades = [g for g in SAND_GRADES if (full["sand_grade"] == g).any()]
+        n_draws = int(full["sample_idx"].nunique())
+
+        fig, axes = plt.subplots(1, len(metrics), figsize=(4.2 * len(metrics), 3.6))
+        for ax, (metric, title) in zip(np.atleast_1d(axes), metrics):
+            data = [full.loc[full["sand_grade"] == g, metric].dropna() for g in grades]
+            parts = ax.violinplot(data, showmedians=True, widths=0.8)
+            for body, grade in zip(parts["bodies"], grades):
+                body.set_facecolor(grade_colors[grade])
+                body.set_alpha(0.75)
+                body.set_edgecolor("none")
+            for piece in ("cmedians", "cbars", "cmins", "cmaxes"):
+                parts[piece].set_color("#52514e")
+                parts[piece].set_linewidth(1)
+            ax.set_xticks(range(1, len(grades) + 1))
+            ax.set_xticklabels(grades)
+            ax.set_title(f"{title}\nall {n_draws} draws, by sanding grade",
+                         fontsize=11)
+            style(ax)
+        fig.tight_layout()
+        fig.savefig(plots / "metric_violins.png", bbox_inches="tight")
+        plt.close(fig)
+
+        keys = ["coin_id", "face", "sand_grade"]
+        spread = full.groupby(keys)[[m for m, _ in metrics]].std()
+        fig, axes = plt.subplots(1, len(metrics), figsize=(4.2 * len(metrics), 3.6))
+        for ax, (metric, title) in zip(np.atleast_1d(axes), metrics):
+            ax.hist(spread[metric].dropna(), bins=40, color="#2a78d6")
+            ax.set_xlabel(f"std of {metric} across {n_draws} draws")
+            ax.set_ylabel("images")
+            style(ax)
+        fig.suptitle("Per-image spread across generations", fontsize=11, y=1.02)
+        fig.tight_layout()
+        fig.savefig(plots / "per_image_spread.png", bbox_inches="tight")
+        plt.close(fig)
+
     # Writes a human-readable evaluation report next to the csv outputs.
     # @params full: per-image dataframe
     # @params by_grade / by_chip / by_clip: grouped summary tables
@@ -1102,6 +1189,8 @@ class CoinRestorationPipeline:
         if multi:
             lines.append("- `plots/best/` — figures using each image's best draw")
             lines.append("- `plots/average/` — figures using the mean over draws")
+            lines.append("- `plots/generations/` — full metric distributions "
+                         "over every draw, and the per-image spread")
             lines.append("- `by_coin/<coin>/` — every sample, triptych and fan "
                          "strip for each coin")
         else:
@@ -1172,6 +1261,552 @@ class CoinRestorationPipeline:
                     self._save_strip(coin_dir / "fan.jpg", img, *samples)
                 else:
                     samples[0].save(flat_png)
+
+    # Measures train/test leakage between two folders of images. Every image
+    # is embedded with an ImageNet ResNet-50, each test image is matched to
+    # its nearest training neighbours by cosine similarity, and the top
+    # matches are re-scored with SSIM (and LPIPS when installed) at pixel
+    # level. A tall isolated peak in the similarity profile means a test coin
+    # has a near-duplicate sitting in the training set.
+    #
+    # With --results (an eval folder) the test set is first narrowed to the
+    # best, worst and an even spread of middle coins by mean restoration score
+    # over their generations, so the pixel scoring and montages run on a
+    # representative subset rather than every test coin. The test-vs-train
+    # cosine is a single matmul over cached embeddings either way, so the
+    # subset saves the scoring and rendering, not the search.
+    # @output leakage_pairs.csv, leakage_report.md, plots/ and either
+    #         top_pairs.jpg (full) or per-tier montages + a quality-vs-leakage
+    #         scatter (eval-guided) in cfg.out
+    def leakage(self):
+        import pandas as pd
+        import torch
+        from skimage.metrics import structural_similarity
+
+        cfg = self.cfg
+        device = cfg.device or self._pick_device()[0]
+        out = Path(cfg.out)
+        (out / "plots").mkdir(parents=True, exist_ok=True)
+
+        embed = self._embedder(device)
+
+        selection = tier_of = None
+        if cfg.results:
+            selection = self._select_by_eval(cfg.results, cfg.rank_metric,
+                                             cfg.group_size)
+            tier_of = {s["coin_id"]: s for s in selection}
+            test_paths = self._paths_for_coins(cfg.test_dir, selection)
+            test_records, test_emb = self._embed_folder(
+                embed, "embedding test", paths=test_paths)
+        else:
+            test_records, test_emb = self._embed_folder(
+                embed, "embedding test", folder=cfg.test_dir)
+
+        # Training embeddings are cached to disk keyed by the folder's
+        # contents: the 8k-image forward pass is the real cost here and it is
+        # identical across reruns, so it is paid once.
+        train_records, train_emb = self._embed_folder(
+            embed, "embedding train", folder=cfg.train_dir,
+            cache_dir=out / "cache")
+        print(f"{len(test_records)} test vs {len(train_records)} train images, "
+              f"device {device}")
+
+        # cosine top-k, chunked over test rows so the full similarity matrix
+        # never has to exist at once
+        k = min(cfg.topk, len(train_records))
+        scores, indices = [], []
+        for start in range(0, len(test_emb), 512):
+            sims = test_emb[start:start + 512] @ train_emb.T
+            top = sims.topk(k, dim=1)
+            scores.append(top.values)
+            indices.append(top.indices)
+        scores = torch.cat(scores).tolist()
+        indices = torch.cat(indices).tolist()
+
+        lpips_scorer = None
+        if not cfg.no_lpips:
+            try:
+                lpips_scorer = self._lpips_scorer(device)
+            except ImportError:
+                print("lpips not installed, skipping (pip install lpips)")
+
+        ones = np.ones((cfg.resolution, cfg.resolution), dtype=np.float32)
+        rows = []
+        for t, (name, path, face_idx) in enumerate(tqdm(test_records,
+                                                        desc="scoring",
+                                                        unit="img")):
+            test01 = self._face01(path, face_idx)
+            for rank in range(k):
+                j = indices[t][rank]
+                train_name, train_path, train_face = train_records[j]
+                train01 = self._face01(train_path, train_face)
+                row = {
+                    "test_image": name,
+                    "coin_id": path.stem,
+                    "rank": rank + 1,
+                    "train_image": train_name,
+                    "cosine": scores[t][rank],
+                    "ssim": self._masked_ssim(test01, train01, ones,
+                                              structural_similarity),
+                }
+                if lpips_scorer:
+                    row["lpips"] = lpips_scorer(test01, train01, ones)
+                if tier_of is not None:
+                    info = tier_of.get(path.stem, {})
+                    row["tier"] = info.get("tier")
+                    row["rank_score"] = info.get("score")
+                rows.append(row)
+
+        df = pd.DataFrame(rows)
+        df.to_csv(out / "leakage_pairs.csv", index=False)
+
+        if selection is None:
+            order = sorted(range(len(test_records)),
+                           key=lambda t: -scores[t][0])[:cfg.pairs]
+            pairs = [(f"{test_records[t][0]}  |  "
+                      f"{train_records[indices[t][0]][0]}   "
+                      f"cos {scores[t][0]:.3f}",
+                      test_records[t], train_records[indices[t][0]])
+                     for t in order]
+            self._pair_sheet(pairs, out / "top_pairs.jpg")
+        else:
+            self._leakage_eval_montages(test_records, train_records, scores,
+                                        indices, tier_of, cfg.rank_metric, out)
+
+        self._leakage_plots(df, out)
+        self._write_leakage_report(df, len(test_records), len(train_records),
+                                   selection, cfg.rank_metric, out)
+
+        print(f"\n-> {out / 'leakage_pairs.csv'}")
+        print(f"-> {out / 'leakage_report.md'}")
+        if selection is None:
+            print(f"-> {out / 'top_pairs.jpg'}")
+        else:
+            print(f"-> {out / 'montage_best.jpg'} (+ middle, worst)")
+            print(f"-> {out / 'plots' / 'quality_vs_leakage.png'}")
+        print(f"-> {out / 'plots/'}")
+
+    # Ranks the evaluated test coins by their mean restoration metric over all
+    # generations and returns three tiers: the best group-size coins, the
+    # worst group-size, and group-size sampled at even rank intervals across
+    # the middle band, so the middle is a spread rather than a median cluster.
+    # @params results_dir: eval folder holding results_per_image.csv
+    # @params metric: one of lpips / psnr / ssim
+    # @params n: coins per tier
+    # @output list of {coin_id, tier, score}, best tier first
+    def _select_by_eval(self, results_dir, metric, n):
+        import pandas as pd
+
+        csv_path = Path(results_dir) / "results_per_image.csv"
+        if not csv_path.exists():
+            sys.exit(f"no results_per_image.csv in {results_dir} "
+                     "(run 'pipeline.py eval' first)")
+        df = pd.read_csv(csv_path, dtype={"coin_id": str})
+        if metric not in df.columns:
+            have = [c for c in ("lpips", "psnr", "ssim") if c in df.columns]
+            sys.exit(f"metric '{metric}' not in results_per_image.csv; "
+                     f"available: {have or 'none'}")
+
+        per_coin = df.groupby("coin_id")[metric].mean().dropna()
+        lower_better = metric == "lpips"
+        ranked = per_coin.sort_values(ascending=lower_better)  # best first
+        ordered = list(ranked.index)
+        n = n if len(ordered) >= 3 * n else len(ordered) // 3
+        if n < 1:
+            sys.exit(f"only {len(ordered)} coins scored; too few to form tiers")
+
+        best = ordered[:n]
+        worst = ordered[len(ordered) - n:]
+        band = ordered[n:len(ordered) - n]
+        if band:
+            picks = np.linspace(0, len(band) - 1, min(n, len(band)))
+            middle = list(dict.fromkeys(band[int(round(i))] for i in picks))
+        else:
+            middle = []
+
+        selection = []
+        for tier, ids in (("best", best), ("middle", middle), ("worst", worst)):
+            for coin_id in ids:
+                selection.append({"coin_id": str(coin_id), "tier": tier,
+                                  "score": float(ranked[coin_id])})
+        print(f"eval-guided: {len(best)} best / {len(middle)} middle / "
+              f"{len(worst)} worst coins by mean {metric} "
+              f"(of {len(ordered)} scored)")
+        return selection
+
+    # Maps each selected coin_id to its scan in the test folder, matching on
+    # filename stem.
+    # @params test_dir: folder of test scans
+    # @params selection: list from _select_by_eval
+    # @output list of Paths, in selection order, for the coins that were found
+    def _paths_for_coins(self, test_dir, selection):
+        test_dir = Path(test_dir)
+        by_stem = {}
+        for path in sorted(test_dir.iterdir()):
+            if path.suffix.lower() in IMAGE_SUFFIXES:
+                by_stem.setdefault(path.stem, path)
+
+        paths, missing = [], []
+        for item in selection:
+            path = by_stem.get(item["coin_id"])
+            if path is not None:
+                paths.append(path)
+            else:
+                missing.append(item["coin_id"])
+        if missing:
+            print(f"warning: {len(missing)} selected coins missing from "
+                  f"{test_dir} (e.g. {missing[:3]})")
+        if not paths:
+            sys.exit(f"none of the selected coins were found in {test_dir}")
+        return paths
+
+    # Renders one montage per quality tier (each coin beside its closest
+    # training match, labelled with its score and cosine) plus the scatter of
+    # restoration score against nearest-neighbour cosine.
+    # @params test_records / train_records: (name, path, face_idx) lists
+    # @params scores / indices: per-test top-k cosines and train indices
+    # @params tier_of: coin_id -> {tier, score} from _select_by_eval
+    # @params metric: ranking metric name, for labels
+    # @params out: output folder
+    def _leakage_eval_montages(self, test_records, train_records, scores,
+                               indices, tier_of, metric, out):
+        # one representative pair per coin: the face whose closest training
+        # neighbour is nearest (coins may contribute two faces under --segment)
+        best = {}
+        for t, rec in enumerate(test_records):
+            coin_id = rec[1].stem
+            if coin_id not in tier_of:
+                continue
+            cosine = scores[t][0]
+            if coin_id not in best or cosine > best[coin_id][0]:
+                best[coin_id] = (cosine, rec, train_records[indices[t][0]])
+
+        lower_better = metric == "lpips"
+        points, tiers = [], {"best": [], "middle": [], "worst": []}
+        for coin_id, (cosine, test_rec, train_rec) in best.items():
+            info = tier_of[coin_id]
+            points.append({"tier": info["tier"], "score": info["score"],
+                           "cosine": cosine})
+            tiers[info["tier"]].append((info["score"], cosine, test_rec,
+                                        train_rec))
+
+        for tier, items in tiers.items():
+            if not items:
+                continue
+            items.sort(key=lambda it: it[0], reverse=not lower_better)
+            sheet = [(f"{test_rec[1].stem}   {metric} {score:.3f}   "
+                      f"cos {cosine:.3f}", test_rec, train_rec)
+                     for score, cosine, test_rec, train_rec in items]
+            self._pair_sheet(sheet, out / f"montage_{tier}.jpg",
+                             title=f"{tier.upper()} restoration tier - "
+                                   f"{len(items)} coins, ranked by mean {metric}")
+
+        self._leakage_eval_scatter(points, metric, out)
+
+    # Scatter of each selected coin's restoration score against its
+    # nearest-neighbour cosine, coloured by tier: if the best-restored coins
+    # cluster at high cosine, restoration quality is tracking leakage.
+    # @params points: list of {tier, score, cosine}
+    # @params metric: ranking metric name, for the axis label
+    # @params out: output folder
+    def _leakage_eval_scatter(self, points, metric, out):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        tier_colors = {"best": "#1baf7a", "middle": "#eda100", "worst": "#d6452a"}
+        plt.rcParams.update({"font.size": 11, "figure.dpi": 150,
+                             "axes.edgecolor": "#d5d4cf"})
+        fig, ax = plt.subplots(figsize=(5.8, 5.2))
+        for tier in ("best", "middle", "worst"):
+            xs = [p["cosine"] for p in points if p["tier"] == tier]
+            ys = [p["score"] for p in points if p["tier"] == tier]
+            ax.scatter(xs, ys, s=30, alpha=0.85, linewidths=0,
+                       color=tier_colors[tier], label=tier)
+        direction = "lower better" if metric == "lpips" else "higher better"
+        ax.set_xlabel("nearest-neighbour cosine similarity (test vs train)")
+        ax.set_ylabel(f"mean {metric} over generations ({direction})")
+        ax.set_title("Restoration quality vs training-set leakage", fontsize=11)
+        ax.legend(title="quality tier", frameon=False)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(color="#e8e7e3", linewidth=0.8)
+        ax.set_axisbelow(True)
+        fig.tight_layout()
+        fig.savefig(out / "plots" / "quality_vs_leakage.png", bbox_inches="tight")
+        plt.close(fig)
+
+    # Builds the embedding function: an ImageNet ResNet-50 with the
+    # classifier removed, so each image maps to a 2048-d feature whose cosine
+    # similarity acts as a perceptual nearness score.
+    # @params device: torch device string
+    # @output callable (list of PIL images) -> L2-normalized cpu tensor (n, 2048)
+    def _embedder(self, device):
+        import torch
+        from torchvision import models
+
+        net = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+        net.fc = torch.nn.Identity()
+        net.eval().to(device)
+
+        # manual ImageNet preprocessing from PIL bytes, so it also works on
+        # torch builds whose numpy interop is broken
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+
+        def prep(img):
+            img = img.convert("RGB").resize((224, 224), Image.BILINEAR)
+            flat = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8)
+            pixels = flat.view(224, 224, 3).permute(2, 0, 1).float() / 255.0
+            return (pixels - mean) / std
+
+        def embed(images):
+            batch = torch.stack([prep(img) for img in images]).to(device)
+            with torch.no_grad():
+                features = net(batch)
+            return torch.nn.functional.normalize(features, dim=1).cpu()
+
+        return embed
+
+    # Embeds a set of images (every segmented face of each when --segment is
+    # set), optionally serving from and writing to an on-disk cache. Pass
+    # either a folder to scan or an explicit list of paths.
+    # @params embed: batch embedding function from _embedder
+    # @params desc: progress bar label
+    # @params folder: directory of scans (scanned when paths is None)
+    # @params paths: explicit list of image paths to embed instead
+    # @params cache_dir: when set, reuse/store embeddings keyed by file content
+    # @output (records, embeddings) where records are (name, path, face_idx)
+    def _embed_folder(self, embed, desc, folder=None, paths=None,
+                      cache_dir=None):
+        import torch
+
+        if paths is None:
+            paths = sorted(p for p in Path(folder).iterdir()
+                           if p.suffix.lower() in IMAGE_SUFFIXES)
+        if not paths:
+            sys.exit(f"no images found in {folder}")
+
+        # Serialised with torch.save (not numpy) so the cache works on the
+        # same builds with broken numpy<->torch interop that _embedder already
+        # sidesteps; the record names/paths/faces ride alongside as JSON.
+        cache_file = cache_meta = None
+        if cache_dir is not None:
+            key = self._emb_cache_key(paths)
+            cache_dir = Path(cache_dir)
+            cache_file = cache_dir / f"emb_{key}.pt"
+            cache_meta = cache_dir / f"emb_{key}.json"
+            if cache_file.exists() and cache_meta.exists():
+                meta = json.loads(cache_meta.read_text())
+                records = [(n, Path(p), int(f)) for n, p, f in
+                           zip(meta["names"], meta["paths"], meta["faces"])]
+                print(f"{desc}: {len(records)} cached embeddings "
+                      f"({cache_file.name})")
+                return records, torch.load(cache_file, map_location="cpu")
+
+        records, chunks, pending = [], [], []
+        for path in tqdm(paths, desc=desc, unit="img"):
+            for face_idx, (suffix, img) in enumerate(self._input_faces(path)):
+                records.append((f"{path.stem}{suffix}", path, face_idx))
+                pending.append(img)
+                if len(pending) == self.cfg.batch:
+                    chunks.append(embed(pending))
+                    pending = []
+        if pending:
+            chunks.append(embed(pending))
+        emb = torch.cat(chunks)
+
+        if cache_file is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            torch.save(emb, cache_file)
+            cache_meta.write_text(json.dumps({
+                "names": [r[0] for r in records],
+                "paths": [str(r[1]) for r in records],
+                "faces": [r[2] for r in records]}))
+            print(f"{desc}: cached -> {cache_file}")
+        return records, emb
+
+    # Content key for the embedding cache: the segment flag, the folder the
+    # images live in, and each file's name, size and mtime, so any edit to the
+    # set (or moving it) recomputes rather than serving stale vectors.
+    # @params paths: the image paths being embedded
+    # @output short hex digest
+    def _emb_cache_key(self, paths):
+        digest = hashlib.md5()
+        digest.update(f"seg={int(self.cfg.segment)}".encode())
+        digest.update(str(paths[0].parent.resolve()).encode())
+        for path in paths:
+            info = path.stat()
+            digest.update(
+                f"{path.name}:{info.st_size}:{int(info.st_mtime)}".encode())
+        return digest.hexdigest()[:16]
+
+    # Reloads one prepared face as a float array for pixel-level scoring.
+    # @params path: source image
+    # @params face_idx: which face of the image
+    # @output float array (res, res, 3) in [0, 1]
+    def _face01(self, path, face_idx):
+        img = self._input_faces(path)[face_idx][1]
+        return np.asarray(img, dtype=np.float32) / 255.0
+
+    # Renders labelled test/train pairs two-per-row into one sheet, each test
+    # face beside its matched training face, so suspected leaks can be checked
+    # by eye.
+    # @params items: list of (label, test record, train record)
+    # @params path: destination jpg
+    # @params title: optional heading drawn across the top
+    def _pair_sheet(self, items, path, title=None):
+        from PIL import ImageDraw
+
+        cell = 320
+        label_height = 26
+        cols = 2
+        top_pad = 34 if title else 0
+        rows = (len(items) + cols - 1) // cols
+        width = cols * cell * 2 + (cols - 1) * 16
+        height = top_pad + rows * (cell + label_height)
+        sheet = Image.new("RGB", (width, height), (255, 255, 255))
+        draw = ImageDraw.Draw(sheet)
+        if title:
+            draw.text((6, 10), title, fill=(20, 20, 20))
+        for i, (label, test_rec, train_rec) in enumerate(items):
+            r, c = divmod(i, cols)
+            x = c * (cell * 2 + 16)
+            y = top_pad + r * (cell + label_height)
+            test_img = self._input_faces(test_rec[1])[test_rec[2]][1]
+            train_img = self._input_faces(train_rec[1])[train_rec[2]][1]
+            sheet.paste(test_img.resize((cell, cell)), (x, y + label_height))
+            sheet.paste(train_img.resize((cell, cell)), (x + cell, y + label_height))
+            draw.text((x + 4, y + 7), label, fill=(20, 20, 20))
+        sheet.save(path, quality=90)
+
+    # Draws the leakage figures: the nearest-neighbour similarity histogram,
+    # the sorted similarity profile, and cosine against SSIM for every top-1
+    # match.
+    # @params df: long-format pairs dataframe with a rank column
+    # @params out: output folder
+    def _leakage_plots(self, df, out):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        accent = "#2a78d6"
+        text_color = "#0b0b0b"
+        plt.rcParams.update({"font.size": 11, "text.color": text_color,
+                             "axes.labelcolor": text_color,
+                             "xtick.color": "#52514e", "ytick.color": "#52514e",
+                             "axes.edgecolor": "#d5d4cf", "figure.dpi": 150})
+
+        def style(ax):
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.grid(axis="y", color="#e8e7e3", linewidth=0.8)
+            ax.set_axisbelow(True)
+
+        top1 = df[df["rank"] == 1]
+
+        fig, axes = plt.subplots(1, 2, figsize=(10.4, 3.6))
+        axes[0].hist(top1["cosine"], bins=40, color=accent)
+        axes[0].set_xlabel("nearest-neighbour cosine similarity")
+        axes[0].set_ylabel("test images")
+        axes[0].set_title("How close is each test image\nto its nearest "
+                          "training image?", fontsize=11)
+        profile = np.sort(top1["cosine"].to_numpy())
+        axes[1].plot(np.linspace(0, 100, len(profile)), profile,
+                     color=accent, linewidth=1.6)
+        axes[1].set_xlabel("percentile of test images")
+        axes[1].set_ylabel("cosine similarity")
+        axes[1].set_title("Similarity profile\n(a spike at the right = "
+                          "near-duplicates)", fontsize=11)
+        for ax in axes:
+            style(ax)
+        fig.tight_layout()
+        fig.savefig(out / "plots/nn_similarity.png", bbox_inches="tight")
+        plt.close(fig)
+
+        fig, ax = plt.subplots(figsize=(5.4, 5.4))
+        ax.scatter(top1["cosine"], top1["ssim"], s=10, alpha=0.6,
+                   color=accent, linewidths=0)
+        ax.set_xlabel("embedding cosine similarity")
+        ax.set_ylabel("SSIM of the matched pair")
+        ax.set_title("Perceptual vs pixel similarity of each\ntest image's "
+                     "closest training match", fontsize=11)
+        style(ax)
+        ax.grid(axis="x", color="#e8e7e3", linewidth=0.8)
+        fig.tight_layout()
+        fig.savefig(out / "plots/cosine_vs_ssim.png", bbox_inches="tight")
+        plt.close(fig)
+
+    # Writes the human-readable leakage summary.
+    # @params df: long-format pairs dataframe
+    # @params n_test / n_train: image counts per folder
+    # @params selection: eval-guided tiers, or None for the full run
+    # @params metric: ranking metric name (used only in eval-guided mode)
+    # @params out: output folder
+    def _write_leakage_report(self, df, n_test, n_train, selection, metric, out):
+        top1 = df[df["rank"] == 1]
+        columns = [("cosine", "max"), ("ssim", "max")]
+        if "lpips" in df.columns:
+            columns.append(("lpips", "min"))
+
+        lines = ["# Leakage report", ""]
+        lines.append(f"{n_test} test images matched against {n_train} "
+                     "training images.")
+        lines.append("Images are embedded with an ImageNet ResNet-50 and each "
+                     "test image is paired with its nearest training image by "
+                     "cosine similarity; SSIM and LPIPS then score the matched "
+                     "pair at pixel level. LPIPS is a distance, so lower means "
+                     "more similar.")
+        lines.append("")
+        if selection is not None:
+            counts = {t: sum(1 for s in selection if s["tier"] == t)
+                      for t in ("best", "middle", "worst")}
+            lines.append("## Eval-guided subset")
+            lines.append("")
+            lines.append(f"Leakage was measured only for the coins ranked by "
+                         f"mean **{metric}** over their generations: the best "
+                         "and worst tiers plus an even spread of the middle.")
+            lines.append("")
+            lines.append("| tier | coins | mean NN cosine |")
+            lines.append("|---|---|---|")
+            for tier in ("best", "middle", "worst"):
+                sub = (top1[top1["tier"] == tier] if "tier" in top1.columns
+                       else top1.iloc[0:0])
+                cos = f"{sub['cosine'].mean():.4f}" if len(sub) else "n/a"
+                lines.append(f"| {tier} | {counts[tier]} | {cos} |")
+            lines.append("")
+            lines.append("See `montage_best.jpg` / `montage_middle.jpg` / "
+                         "`montage_worst.jpg` and "
+                         "`plots/quality_vs_leakage.png`.")
+            lines.append("")
+        lines.append("## Nearest-neighbour similarity")
+        lines.append("")
+        header = " | ".join(name for name, _ in columns)
+        lines.append(f"| stat | {header} |")
+        lines.append("|---|" + "---|" * len(columns))
+        stats = [("mean", "mean"), ("median", "median"),
+                 ("most similar", None)]
+        for label, how in stats:
+            cells = []
+            for name, extreme in columns:
+                value = getattr(top1[name], how or extreme)()
+                cells.append(f"{value:.4f}")
+            lines.append(f"| {label} | " + " | ".join(cells) + " |")
+        lines.append("")
+        lines.append("## Ten most similar pairs")
+        lines.append("")
+        lines.append("| test | train | " + header + " |")
+        lines.append("|---|---|" + "---|" * len(columns))
+        closest = top1.sort_values("cosine", ascending=False).head(10)
+        for _, row in closest.iterrows():
+            cells = " | ".join(f"{row[name]:.4f}" for name, _ in columns)
+            lines.append(f"| {row['test_image']} | {row['train_image']} "
+                         f"| {cells} |")
+        lines.append("")
+        lines.append("Cosine above ~0.95 together with high SSIM usually means "
+                     "the same coin appears in both folders. Check those pairs "
+                     "in `top_pairs.jpg`.")
+        (out / "leakage_report.md").write_text("\n".join(lines) + "\n")
 
     # Prints a stage banner so the pipeline output is easy to scan.
     # @params idx: stage number
@@ -1519,6 +2154,9 @@ def parse_args():
     infer = sub.add_parser("infer", help="inference over a split")
     evaluate = sub.add_parser("eval", help="score downloaded results locally")
     restore = sub.add_parser("restore", help="restore arbitrary images")
+    leakage = sub.add_parser("leakage", help="nearest-neighbour similarity "
+                             "between two image folders (e.g. test vs "
+                             "training) to measure dataset leakage")
 
     for p in (run, prepare):
         add_shared(p)
@@ -1577,6 +2215,39 @@ def parse_args():
     evaluate.add_argument("--no-lpips", action="store_true")
     evaluate.add_argument("--no-fid", action="store_true")
     evaluate.add_argument("--train-log", default=None)
+    evaluate.add_argument("--replot", action="store_true",
+                          help="rebuild plots and reports from an existing "
+                               "results_per_image.csv without rescoring")
+
+    leakage.add_argument("--test-dir", required=True)
+    leakage.add_argument("--train-dir", required=True)
+    leakage.add_argument("--out", default="leakage_out")
+    leakage.add_argument("--segment", action="store_true",
+                         help="segment each scan into faces and compare "
+                              "per face instead of per full image")
+    leakage.add_argument("--topk", type=int, default=5,
+                         help="training neighbours kept per test image")
+    leakage.add_argument("--pairs", type=int, default=20,
+                         help="most similar pairs rendered in top_pairs.jpg")
+    leakage.add_argument("--batch", type=int, default=32)
+    leakage.add_argument("--resolution", type=int, default=512,
+                         help="side at which faces are squared for pixel "
+                              "scoring and the pair sheet")
+    leakage.add_argument("--device", default=None,
+                         help="cuda / mps / cpu, autodetected when omitted")
+    leakage.add_argument("--no-lpips", action="store_true")
+    leakage.add_argument("--results", default=None,
+                         help="eval results folder holding "
+                              "results_per_image.csv; enables the eval-guided "
+                              "subset that measures leakage only for the best, "
+                              "worst and middle coins by restoration score")
+    leakage.add_argument("--rank-metric", default="lpips",
+                         choices=["lpips", "psnr", "ssim"],
+                         help="restoration metric that ranks coins into tiers "
+                              "in --results mode (default lpips, lower better)")
+    leakage.add_argument("--group-size", type=int, default=20,
+                         help="coins per tier (best / middle / worst) in "
+                              "--results mode")
 
     add_shared(restore)
     restore.add_argument("--model", required=True)
@@ -1617,6 +2288,8 @@ def main():
         pipeline.evaluate()
     elif cfg.command == "restore":
         pipeline.restore()
+    elif cfg.command == "leakage":
+        pipeline.leakage()
 
 
 if __name__ == "__main__":
