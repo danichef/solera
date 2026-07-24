@@ -20,19 +20,6 @@ def _angular_noise(rng, n, low=2.0, high=9.0):
 # and the coin mask is shrunk to the new shape.
 class ChipFilter(DamageFilter):
 
-    # @params amplitude: depth of the rim nibbles, relative to the radius
-    # @params threshold: noise level a peak must clear to become a chip
-    # @params low_weight / high_weight / low_cut / high_lo / high_hi: the two
-    #         frequency bands of the rim noise ring
-    # @params sharpness: exponent shaping the bite profile
-    # @params waviness: gentle irregularity over the whole rim
-    # @params n_angles: angular resolution of the rim profile
-    # @params big_chip_prob: chance of a large flan clip
-    # @params big_chip_depth / big_chip_radius: clip size ranges, in radii
-    # @params big_chip_rough: roughness of the clip outline
-    # @params second_chip_frac: chance a clip gets a partner opposite it
-    # @params edge_shade: darkness of the shading band along the cut
-    # @params edge_width_frac / shadow_margin_frac: geometry of that shading
     def __init__(self,
                  amplitude=0.07,
                  threshold=0.48,
@@ -52,33 +39,37 @@ class ChipFilter(DamageFilter):
                  edge_shade=0.55,
                  edge_width_frac=0.030,
                  shadow_margin_frac=0.045):
-        self.amplitude = amplitude
-        self.threshold = threshold
+        # the small rim nibbles
+        self.amplitude = amplitude   # bite depth, relative to the radius
+        self.threshold = threshold   # noise level a peak must clear to bite
+        self.sharpness = sharpness   # exponent shaping the bite profile
+        self.waviness = waviness     # gentle irregularity over the whole rim
+        self.n_angles = n_angles     # angular resolution of the rim profile
+
+        # the two frequency bands of the rim noise ring
         self.low_weight = low_weight
         self.high_weight = high_weight
         self.low_cut = low_cut
         self.high_lo = high_lo
         self.high_hi = high_hi
-        self.sharpness = sharpness
-        self.waviness = waviness
-        self.n_angles = n_angles
-        self.big_chip_prob = big_chip_prob
-        self.big_chip_depth = big_chip_depth
-        self.big_chip_radius = big_chip_radius
-        self.big_chip_rough = big_chip_rough
-        self.second_chip_frac = second_chip_frac
-        self.edge_shade = edge_shade
-        self.edge_width_frac = edge_width_frac
-        self.shadow_margin_frac = shadow_margin_frac
 
-    # Builds the per-angle bite depth from the two noise bands and reads off,
-    # for each pixel, whether it sits closer to the edge than its angle's bite.
-    # @params rng: numpy generator
-    # @params dist: distance transform of the coin interior
-    # @params cy, cx: coin centroid
-    # @params radius: effective coin radius
-    # @params H, W: image size
-    # @output signed field, positive where the rim is bitten
+        # the occasional big flan clip
+        self.big_chip_prob = big_chip_prob        # chance of one happening
+        self.big_chip_depth = big_chip_depth      # depth range, in radii
+        self.big_chip_radius = big_chip_radius    # size range, in radii
+        self.big_chip_rough = big_chip_rough      # roughness of the clip outline
+        self.second_chip_frac = second_chip_frac  # chance of a partner opposite it
+
+        # the dark shading drawn along a fresh cut
+        self.edge_shade = edge_shade                    # how dark the band gets
+        self.edge_width_frac = edge_width_frac          # its width
+        self.shadow_margin_frac = shadow_margin_frac    # halo reach outside the old rim
+
+    # Build the per-angle bite depth from the two noise bands, then for each
+    # pixel read off whether it sits closer to the edge than its angle's bite.
+    # dist is the distance transform of the coin interior, (cy, cx) the centroid,
+    # radius the effective coin radius, and (H, W) the image size. Returns a
+    # signed field, positive where the rim is bitten.
     def _small_chip_field(self, rng, dist, cy, cx, radius, H, W):
         N = self.n_angles
         k = np.fft.rfftfreq(N, d=1.0 / N)
@@ -106,13 +97,10 @@ class ChipFilter(DamageFilter):
         depth_map = depth1d[idx].astype(np.float32)
         return depth_map - dist
 
-    # Walks outward along one direction to find where the rim really is, since
-    # a real flan is never a perfect circle.
-    # @params coin: boolean coin mask
-    # @params cy, cx: coin centroid
-    # @params ang: direction in radians
-    # @params r_max: effective coin radius
-    # @output rim distance along that direction
+    # Walk outward from the centroid (cy, cx) along direction ang (radians) to
+    # find where the rim really is, since a real flan is never a perfect circle.
+    # r_max is how far out we bother searching. Returns the rim distance along
+    # that direction.
     def _rim_radius(self, coin, cy, cx, ang, r_max):
         ts = np.linspace(0.3 * r_max, 1.6 * r_max, 260)
         ys = np.clip((cy + ts * np.sin(ang)).astype(int), 0, coin.shape[0] - 1)
@@ -122,15 +110,11 @@ class ChipFilter(DamageFilter):
             return r_max
         return float(ts[np.where(hit)[0][-1]])
 
-    # Now and then takes one big circular bite out of the rim (occasionally a
+    # Now and then take one big circular bite out of the rim (occasionally a
     # second one roughly opposite), with a roughened edge so it isn't a perfect
-    # circle.
-    # @params rng: numpy generator
-    # @params coin: boolean coin mask
-    # @params cy, cx: coin centroid
-    # @params radius: effective coin radius
-    # @params H, W: image size
-    # @output (signed field positive inside the clips, list of clip records)
+    # circle. (cy, cx) is the centroid, radius the effective radius, (H, W) the
+    # image size. Returns (signed field positive inside the clips, list of clip
+    # records).
     def _big_chip_field(self, rng, coin, cy, cx, radius, H, W):
         field = np.full((H, W), -1e6, dtype=np.float32)
         chips = []
@@ -170,16 +154,12 @@ class ChipFilter(DamageFilter):
         return np.array([float(np.median(image[..., c][bg]))
                          for c in range(3)], np.float32)
 
-    # Draws the dark contour along each cut: a thin line hugging the break and a
+    # Draw the dark contour along each cut: a thin line hugging the break and a
     # gradient band fading inward, both broken up by noise. Without this a chip
-    # looks like an eraser stroke instead of a broken edge.
-    # @params result: the image with the bites already filled
-    # @params s: the signed bite field
-    # @params bite: boolean map of bitten pixels
-    # @params new_coin: coin mask after biting
-    # @params rng: numpy generator
-    # @params radius: effective coin radius
-    # @output the shaded image
+    # looks like an eraser stroke instead of a broken edge. result is the image
+    # with the bites already filled, s the signed bite field, bite the boolean
+    # map of bitten pixels, new_coin the mask after biting. Returns the shaded
+    # image.
     def _shade_cut_edges(self, result, s, bite, new_coin, rng, radius):
         w = max(2.0, self.edge_width_frac * radius)
         noise = ndimage.gaussian_filter(
@@ -197,12 +177,9 @@ class ChipFilter(DamageFilter):
         shade = 1.0 - np.clip(0.55 * line + self.edge_shade * band, 0.0, 0.75) * noise
         return result * np.clip(shade, 0.0, 1.0)[..., None]
 
-    # Runs the chipping on one face.
-    # @params image: float RGB image in [0, 1]
-    # @params coin_mask: float mask of the coin pixels
-    # @params seed: seed for all the chip randomness
-    # @output DamageResult with the bite map as damage_mask and the shrunken
-    #         silhouette as coin_mask
+    # Run the chipping on one face. seed drives all the chip randomness. Returns
+    # a DamageResult with the bite map as its damage_mask and the shrunken
+    # silhouette as its coin_mask.
     def apply(self, image, coin_mask, seed=None) -> DamageResult:
         rng = np.random.default_rng(seed)
         H, W = coin_mask.shape

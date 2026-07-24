@@ -13,14 +13,11 @@ def _norm(v):
     return v / max(float(np.linalg.norm(v)), 1e-6)
 
 
-# Guesses the lamp direction from the photo by least-squares fitting luminance
-# against normals off a band-passed height field. If the fit is hopeless we
-# fall back to upper-left, which is how these coins are usually shot.
-# @params L: luminance of the original image
-# @params inside: boolean coin mask
-# @params macro_sigma / bowl_sigma: the band-pass blurs
-# @params elevation: fixed z of the light
-# @output unit light direction
+# Guess the lamp direction from the photo by least-squares fitting luminance
+# against normals off a band-passed height field (macro_sigma and bowl_sigma
+# are the two blurs, elevation fixes the light's z). If the fit is hopeless we
+# fall back to upper-left, which is how these coins are usually shot. Returns a
+# unit light direction.
 def estimate_light(L, inside, macro_sigma=8.0, bowl_sigma=40.0, elevation=0.6):
     z = ndimage.gaussian_filter(L, macro_sigma) - ndimage.gaussian_filter(L, bowl_sigma)
     zy, zx = np.gradient(z)
@@ -50,13 +47,10 @@ def estimate_light(L, inside, macro_sigma=8.0, bowl_sigma=40.0, elevation=0.6):
     return _norm([lx, ly, elevation])
 
 
-# Surface normals from a band-passed height field, with an optional dab of
-# fine detail for small-scale shading.
-# @params L: luminance of the original image
-# @params macro_sigma / bowl_sigma: band-pass blurs
-# @params height_scale: height exaggeration
-# @params fine_sigma / fine_amt: the fine-detail band and its weight
-# @output (nx, ny, nz) normal maps
+# Surface normals from a band-passed height field (macro_sigma / bowl_sigma are
+# the blurs, height_scale exaggerates the relief), with an optional dab of fine
+# detail on top: fine_sigma sets the band, fine_amt its weight. Returns the
+# (nx, ny, nz) normal maps.
 def macro_normals(L, macro_sigma=8.0, bowl_sigma=40.0, height_scale=5.0,
                   fine_sigma=1.5, fine_amt=0.0):
     z = (ndimage.gaussian_filter(L, macro_sigma)
@@ -68,11 +62,8 @@ def macro_normals(L, macro_sigma=8.0, bowl_sigma=40.0, height_scale=5.0,
     return (-zx * nz).astype(np.float32), (-zy * nz).astype(np.float32), nz.astype(np.float32)
 
 
-# Reads the coin's own polished tone off its brightest pixels.
-# @params rgb: float RGB image
-# @params inside: boolean coin mask
-# @params bright_pct: luminance percentile that counts as a highlight
-# @output RGB tone
+# Read the coin's own polished tone off its brightest pixels: anything above
+# the bright_pct luminance percentile counts as a highlight. Returns an RGB tone.
 def silver_tone(rgb, inside, bright_pct=80.0):
     L = _lum(rgb)
     if not inside.any():
@@ -84,19 +75,12 @@ def silver_tone(rgb, inside, bright_pct=80.0):
     return np.array([float(np.median(rgb[..., c][bright])) for c in range(3)], np.float32)
 
 
-# Blinn-Phong specular layer. Faces pointing at the light glint; a gate keeps
-# the shine out of the coin's dark recesses; and if asked, sparse hairlines are
-# carved out so worn silver shines with interruptions rather than evenly.
-# @params nx, ny, nz: normal maps
-# @params light: light direction
-# @params L_for_gate: luminance used for the recess gate
-# @params inside: boolean coin mask
-# @params shininess: specular exponent
-# @params gate_pct: percentile below which nothing shines
-# @params broaden: final blur of the layer
-# @params grain: hairline scratch strength
-# @params rng: generator for the scratch angles
-# @output float specular map
+# Blinn-Phong specular layer. Faces pointing at the light glint; a gate driven
+# by L_for_gate keeps the shine out of the coin's dark recesses (nothing shines
+# below the gate_pct percentile); and if grain is set, sparse hairlines are
+# carved out with rng so worn silver shines with interruptions rather than
+# evenly. shininess is the specular exponent, broaden the final blur. Returns a
+# float specular map.
 def specular_layer(nx, ny, nz, light, L_for_gate, inside,
                    shininess=12.0, gate_pct=45.0, broaden=1.2,
                    grain=0.0, rng=None):
@@ -130,19 +114,15 @@ def specular_layer(nx, ny, nz, light, L_for_gate, inside,
     return out.astype(np.float32)
 
 
-# Hunts down the big dark blobs the wear step can leave behind and lifts them
+# Hunt down the big dark blobs the wear step can leave behind and lift them
 # toward the local average. Heavy wear should flatten contrast, not paint black
 # smears onto the coin.
-# @params worn: the image after wear
-# @params orig_mean: mean luminance of the original, to hold brightness steady
-# @params inside: boolean coin mask
-# @params lift: how hard the blobs are brightened
-# @params field_sigma: blur radius of the local average
-# @params dark_thr: darkness that counts as a blob
-# @params min_area: smallest blob worth fixing, in pixels
-# @params rim_erode: pixels trimmed off the rim before the search
-# @params keep_mean: rescale back to the original mean afterwards
-# @output the tidied image
+#
+# worn is the image after wear and orig_mean its starting mean luminance, which
+# we hold steady when keep_mean is on. lift sets how hard the blobs brighten; a
+# blob has to be darker than dark_thr and at least min_area pixels to count, and
+# rim_erode trims the rim first so the edge isn't mistaken for a shadow.
+# field_sigma is the blur radius of the local average.
 def reduce_big_shadows(worn, orig_mean, inside, lift=0.6, field_sigma=16.0,
                        dark_thr=0.36, min_area=90, rim_erode=8, keep_mean=True):
     Lw = _lum(worn)
@@ -174,21 +154,17 @@ def reduce_big_shadows(worn, orig_mean, inside, lift=0.6, field_sigma=16.0,
     return np.clip(worn * ratio, 0.0, 1.0).astype(np.float32)
 
 
-# Re-lights a sanded coin so it reads as handled silver rather than airbrushed:
+# Re-light a sanded coin so it reads as handled silver rather than airbrushed:
 # nudge the colour toward the coin's own metal tone, drop a specular glint on
 # from the estimated light, and pull the brightness back to where it started.
-# @params B: the sanded image
-# @params original: the original, used for normals and the light estimate
-# @params inside: boolean coin mask
-# @params light: light direction, estimated from the photo if None
-# @params silver_boost: how hard to pull toward the metal tone
-# @params spec_gain / shininess / spec_color / gate_pct: specular settings
-# @params fine_amt: fine detail in the normals
-# @params brightness_bias: target brightness vs the original
-# @params silver_hue: fallback hue for near-grey coins
-# @params spec_grain: hairline scratch strength in the shine
-# @params rng: generator for the scratches
-# @output (relit image, light direction used, specular map)
+#
+# B is the sanded image, original the untouched one (used for the normals and
+# the light estimate); if light is None it gets estimated from the photo. The
+# rest tune the look: silver_boost is how hard we pull toward the metal tone,
+# spec_gain / shininess / spec_color / gate_pct shape the glint, fine_amt adds
+# fine detail to the normals, brightness_bias sets the target brightness,
+# silver_hue is the fallback tint for near-grey coins, and spec_grain / rng
+# carve the hairline scratches. Returns (relit image, light used, specular map).
 def silverize_and_shine(B, original, inside, light=None,
                         silver_boost=0.35, spec_gain=0.5, shininess=12.0,
                         spec_color=(1.0, 0.99, 0.95), gate_pct=45.0,

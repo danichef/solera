@@ -46,9 +46,8 @@ _WORKER_CFG = {}
 
 
 # Chip parameters, drawn independently of the sanding grade (the professor's
-# point: a well-kept coin can still have a nicked rim).
-# @params rng: numpy generator
-# @output dict of ChipFilter overrides, or None for a chip-free coin
+# point: a well-kept coin can still have a nicked rim). Returns a dict of
+# ChipFilter overrides, or None for a chip-free coin.
 def sample_chip_params(rng):
     if rng.random() < CHIP_NONE_PROB:
         return None
@@ -58,13 +57,9 @@ def sample_chip_params(rng):
     return params
 
 
-# Wears one face down at the given grade, then adds independently sampled rim
-# chips on top.
-# @params image: float RGB face crop in [0, 1]
-# @params coin_mask: float mask of the coin pixels
-# @params sand_grade: one of SAND_GRADES
-# @params seed: seed for this damage variant
-# @output (damaged image, metadata record)
+# Wear one face down at the given sand_grade (one of SAND_GRADES), then add
+# independently sampled rim chips on top. seed fixes this damage variant.
+# Returns (damaged image, metadata record).
 def damage_face(image, coin_mask, sand_grade, seed):
     rng = np.random.default_rng(seed)
     worn = SilverWearFilter.for_grade(sand_grade).apply(image, coin_mask, seed=seed)
@@ -93,10 +88,9 @@ def damage_face(image, coin_mask, sand_grade, seed):
     return res.image, record
 
 
-# Hashes a coin id into a split. Doing it by hash rather than shuffling means
-# adding more coins later never shuffles an existing one into a different split.
-# @params coin_id: filename stem of the scan
-# @output "train", "val" or "test"
+# Hash a coin id into a split. Doing it by hash rather than shuffling means that
+# adding more coins later never bumps an existing one into a different split.
+# coin_id is the scan's filename stem; returns "train", "val" or "test".
 def stable_split(coin_id):
     bucket = int(hashlib.md5(coin_id.encode()).hexdigest(), 16) % 100
     if bucket < 80:
@@ -112,13 +106,10 @@ def stable_seed(*parts):
     return int(hashlib.md5(key.encode()).hexdigest()[:8], 16)
 
 
-# Pads an image (or mask) onto a square canvas and resizes to res. The fill is
-# white for images, black for masks, so nothing bleeds in from the padding.
-# @params img: float image or mask in [0, 1]
-# @params res: output side in pixels
-# @params fill: padding value
-# @params resample: PIL resampling filter
-# @output uint8 array, (res, res[, 3])
+# Pad an image (or mask) onto a square canvas and resize to res pixels a side.
+# fill is the padding value (white for images, black for masks) so nothing
+# bleeds in from the padding, and resample is the PIL filter to resize with.
+# Returns a uint8 array, (res, res) or (res, res, 3).
 def to_square(img, res, fill, resample):
     h, w = img.shape[:2]
     side = max(h, w)
@@ -152,10 +143,9 @@ def _init_worker(cfg):
 
 
 # One coin scan, start to finish, inside a worker: segment the faces, save the
-# clean target and its mask, then render all four damage grades. Runs in a pool
-# so it has to catch its own errors and report them back rather than crash.
-# @params jpg_path_str: path to the source scan
-# @output ("ok", coin_id, rows) or ("error", coin_id, message)
+# clean target and its mask, then render all four damage grades. It runs in a
+# pool, so it has to catch its own errors and report them back rather than
+# crash. Returns ("ok", coin_id, rows) or ("error", coin_id, message).
 def _process_coin(jpg_path_str):
     out = Path(_WORKER_CFG["out"])
     res = _WORKER_CFG["res"]
@@ -197,10 +187,9 @@ def _process_coin(jpg_path_str):
         return "error", coin_id, f"{type(exc).__name__}: {exc}"
 
 
-# A quick eyeball sheet: one row per face, clean image beside its four grades.
-# @params out: dataset root with the saved images
-# @params rows: metadata rows to draw from
-# @params n_faces: how many faces to show
+# A quick eyeball sheet: one row per face, the clean image beside its four
+# grades. out is the dataset root with the saved images, rows the metadata to
+# draw from, and n_faces caps how many faces we show.
 def make_contact_sheet(out, rows, n_faces=6):
     groups, seen = [], set()
     for row in rows:
@@ -233,16 +222,16 @@ def make_contact_sheet(out, rows, n_faces=6):
 
 class CoinRestorationPipeline:
 
-    # Holds the parsed CLI config; every stage reads its settings from here.
-    # @params cfg: argparse namespace produced by main()
+    # Holds the parsed CLI config (the argparse namespace from main); every
+    # stage reads its settings from here.
     def __init__(self, cfg):
         self.cfg = cfg
 
     # Runs everything hands-off: a tiny smoke validation first, then the full
-    # pipeline including an automatic guidance sweep before the test pass.
-    # Every phase skips itself when its output already exists, so rerunning
-    # this after any interruption just continues.
-    # @output nothing; prints a summary with all artifact locations
+    # pipeline, including an automatic guidance sweep before the test pass. Every
+    # phase skips itself when its output already exists, so rerunning this after
+    # an interruption just picks up where it left off. Prints a summary of where
+    # all the artifacts landed.
     def run(self):
         started = time.time()
 
@@ -258,9 +247,9 @@ class CoinRestorationPipeline:
         print(f"  results: {self.cfg.results}")
         print("next: download the results tar and run 'pipeline.py eval' on your machine")
 
-    # Runs the whole pipeline in miniature (20 coins, 100 steps) into *_smoke
+    # Run the whole pipeline in miniature (20 coins, 100 steps) into *_smoke
     # paths, so a config or data problem surfaces in minutes instead of hours.
-    # @output nothing; raises if any stage fails
+    # Raises if any stage fails.
     def _run_smoke_validation(self):
         original = self.cfg
         smoke = argparse.Namespace(**vars(original))
@@ -288,8 +277,7 @@ class CoinRestorationPipeline:
             self.cfg = original
         print("smoke validation passed, starting the full run")
 
-    # Executes the four stages with skip logic and training auto-resume.
-    # @output nothing
+    # Execute the four stages, with skip logic and training auto-resume.
     def _run_stages(self):
         cfg = self.cfg
         data = Path(cfg.data)
@@ -327,10 +315,9 @@ class CoinRestorationPipeline:
             self._banner(4, "test inference")
             self._timed(self.infer)
 
-    # Restores a small val subset at several guidance scales and keeps the one
-    # with the best masked PSNR, so the test pass never runs on a bad default.
-    # The choice is cached in guidance.json and reused on reruns.
-    # @output the winning guidance scale
+    # Restore a small val subset at several guidance scales and keep the one with
+    # the best masked PSNR, so the test pass never runs on a bad default. The
+    # winner is cached in guidance.json and reused on reruns.
     def _pick_guidance(self):
         cfg = self.cfg
         cache = Path(cfg.output_dir) / "guidance.json"
@@ -355,9 +342,8 @@ class CoinRestorationPipeline:
         print(f"picked guidance {best}")
         return best
 
-    # Scores one sweep folder: average masked PSNR of restored vs clean.
-    # @params results_dir: folder written by infer()
-    # @output mean PSNR in dB
+    # Score one sweep folder (as written by infer): the average masked PSNR of
+    # restored vs clean, in dB.
     def _mean_masked_psnr(self, results_dir):
         data = Path(self.cfg.data)
         res = self.cfg.resolution
@@ -374,9 +360,9 @@ class CoinRestorationPipeline:
             values.append(self._masked_psnr(clean, restored, mask))
         return float(np.nanmean(values))
 
-    # Generates the paired dataset: for every coin, both faces are segmented
-    # and each face is damaged at all four sanding grades.
-    # @output dataset folder with train/val/test splits and metadata.csv
+    # Generate the paired dataset: for every coin, both faces are segmented and
+    # each face is damaged at all four sanding grades. Writes a dataset folder
+    # with train/val/test splits and a metadata.csv.
     def prepare_data(self):
         cfg = self.cfg
         src = Path(cfg.src)
@@ -434,9 +420,9 @@ class CoinRestorationPipeline:
                 tar.add(out / "metadata.csv", arcname="metadata.csv")
             print(f"-> {tar_path} ({tar_path.stat().st_size / 1e9:.2f} GB)")
 
-    # Fine-tunes SDXL as an InstructPix2Pix restorer with a masked latent loss
-    # and EMA weights; saves the final pipeline and optionally pushes it to HF.
-    # @output fine-tuned model at <output-dir>/final
+    # Fine-tune SDXL as an InstructPix2Pix restorer, with a masked latent loss
+    # and EMA weights. Saves the final pipeline to <output-dir>/final and
+    # optionally pushes it to Hugging Face.
     def train(self):
         import torch
         import torch.nn.functional as F
@@ -619,16 +605,15 @@ class CoinRestorationPipeline:
             if cfg.push_to_hub:
                 self._push_to_hub(final_dir)
 
-    # Restores every image of one split with the trained model. With
-    # --num-samples above 1 it draws several restorations per image from
-    # different noise seeds, showing the distribution of plausible originals,
-    # and composes a "fan" strip (damaged | samples | clean) per image.
-    # The override arguments let the guidance sweep reuse this with different
-    # settings without touching the main config.
-    # @params override_split / override_limit / override_guidance /
-    #         override_out / override_tar / override_samples: one-off settings
-    # @output results folder: flat restored/+triptychs/ for one draw, or one
-    #         by_coin/<coin>/ subfolder per image (samples + triptych + fan)
+    # Restore every image of one split with the trained model. With --num-samples
+    # above 1 it draws several restorations per image from different noise seeds,
+    # showing the spread of plausible originals, and lays out a "fan" strip
+    # (damaged | samples | clean) per image.
+    #
+    # The override_* arguments let the guidance sweep reuse this with one-off
+    # settings without touching the main config. The results folder is flat
+    # (restored/ + triptychs/) for a single draw, or one by_coin/<coin>/
+    # subfolder per image (samples + triptych + fan) when several are drawn.
     def infer(self, override_split=None, override_limit=None,
               override_guidance=None, override_out=None, override_tar=None,
               override_samples=None):
@@ -730,9 +715,8 @@ class CoinRestorationPipeline:
                 tar.add(out, arcname=out.name)
             print(f"-> {tar_path} ({tar_path.stat().st_size / 1e9:.2f} GB)")
 
-    # Pastes a row of images into one strip and saves it.
-    # @params path: destination jpg
-    # @params images: PIL images, laid out left to right
+    # Paste a row of PIL images (left to right) into one strip and save it to
+    # path.
     def _save_strip(self, path, *images):
         width, height = images[0].size
         strip = Image.new("RGB", (width * len(images), height), (255, 255, 255))
@@ -740,18 +724,14 @@ class CoinRestorationPipeline:
             strip.paste(cell.resize((width, height)), (i * width, 0))
         strip.save(path, quality=90)
 
-    # Lays out one image's sample fan: the damaged input, every drawn
-    # restoration, and the clean target in a single row.
-    # @params path: destination jpg
-    # @params damaged_img: the conditioning input
-    # @params samples: list of restored PIL images
-    # @params clean: the ground-truth image
+    # Lay out one image's sample fan in a single row: the damaged input, every
+    # drawn restoration, then the clean target, saved to path.
     def _save_fan(self, path, damaged_img, samples, clean):
         self._save_strip(path, damaged_img, *samples, clean)
 
-    # Scores the downloaded results against the clean targets with masked
+    # Score the downloaded results against the clean targets with masked
     # PSNR / SSIM / LPIPS, grouped by the damage state each image came from.
-    # @output results_per_image.csv and results_summary.csv next to the results
+    # Writes results_per_image.csv and results_summary.csv next to the results.
     def evaluate(self):
         import pandas as pd
         from skimage.metrics import structural_similarity
@@ -819,13 +799,11 @@ class CoinRestorationPipeline:
         print(f"-> {results / 'results_report.md'}")
         print(f"-> {results / 'plots/'}")
 
-    # Scores every restored image against its clean target with masked
-    # PSNR / SSIM / LPIPS, plus the damaged-input baseline.
-    # @params data: dataset folder
-    # @params results: results folder holding results_metadata.csv
-    # @params res: evaluation resolution
-    # @params structural_similarity: skimage ssim function
-    # @output per-image dataframe of metadata plus metric columns
+    # Score every restored image against its clean target with masked
+    # PSNR / SSIM / LPIPS, plus the damaged-input baseline. data is the dataset
+    # folder, results the folder holding results_metadata.csv, res the eval
+    # resolution, and structural_similarity skimage's ssim function. Returns a
+    # per-image dataframe of the metadata plus the metric columns.
     def _score_results(self, data, results, res, structural_similarity):
         import pandas as pd
 
@@ -865,11 +843,10 @@ class CoinRestorationPipeline:
 
         return pd.concat([df, pd.DataFrame(records)], axis=1)
 
-    # When several samples were drawn per image, reports the oracle score of
-    # the best draw: how good the distribution's best answer is, per image,
-    # averaged over the test set.
-    # @params full: per-image dataframe with metric columns
-    # @output dict of formatted best-of-N stats, or None for single samples
+    # When several samples were drawn per image, report the oracle score of the
+    # best draw: how good the distribution's best answer is, per image, averaged
+    # over the test set. full is the per-image dataframe with the metric columns.
+    # Returns a dict of formatted best-of-N stats, or None for single samples.
     def _best_of_samples(self, full):
         if "sample_idx" not in full.columns or full["sample_idx"].nunique() < 2:
             return None
@@ -884,12 +861,12 @@ class CoinRestorationPipeline:
             result[metric] = f"{per_image.mean():.4f} ± {per_image.std():.4f}"
         return result
 
-    # Computes distribution-level FID: restored vs clean, plus the damaged vs
-    # clean baseline that shows how far restoration moved the distribution.
-    # Gathers restored images from the metadata so it works whether they sit
-    # in a flat folder or in per-coin subfolders.
-    # @params full: per-image dataframe with the restored_path column
-    # @output dict with both scores, or None when pytorch-fid is missing
+    # Compute distribution-level FID: restored vs clean, plus the damaged vs
+    # clean baseline that shows how far restoration moved the distribution. It
+    # gathers the restored images from the metadata (the full dataframe's
+    # restored_path column) so it works whether they sit in a flat folder or in
+    # per-coin subfolders. Returns a dict with both scores, or None when
+    # pytorch-fid isn't installed.
     def _compute_fid(self, full):
         try:
             from pytorch_fid import fid_score
@@ -922,11 +899,10 @@ class CoinRestorationPipeline:
         print(f"FID restored: {fid_restored:.2f}   FID damaged: {fid_damaged:.2f}")
         return {"restored": fid_restored, "damaged": fid_damaged}
 
-    # Collapses several samples per image down to one row each, so the plots
-    # can show either the best draw or the average draw.
-    # @params full: per-image, per-sample dataframe
-    # @params how: "best" (oracle per metric) or "average" (mean over draws)
-    # @output one-row-per-image dataframe
+    # Collapse several samples per image down to one row each, so the plots can
+    # show either the best draw or the average. how is "best" (the oracle per
+    # metric) or "average" (the mean over draws). Returns a one-row-per-image
+    # dataframe.
     def _collapse_per_image(self, full, how):
         keys = ["coin_id", "face", "sand_grade"]
         best_dir = {"psnr": "max", "ssim": "max", "lpips": "min",
@@ -940,11 +916,10 @@ class CoinRestorationPipeline:
                 agg[col] = "first"
         return full.groupby(keys, as_index=False).agg(agg)
 
-    # Draws the evaluation figures: metrics by damage state, the per-image
-    # improvement scatter, metric distributions, and the training loss curve.
-    # @params full: per-image dataframe with metric columns
-    # @params results: results folder
-    # @params subdir: where the figures land, e.g. "plots" or "plots/best"
+    # Draw the evaluation figures: metrics by damage state, the per-image
+    # improvement scatter, the metric distributions, and the training loss curve.
+    # full is the per-image dataframe, results the results folder, and subdir
+    # where the figures land (e.g. "plots" or "plots/best").
     def _make_plots(self, full, results, subdir):
         import matplotlib
         matplotlib.use("Agg")
@@ -1063,12 +1038,11 @@ class CoinRestorationPipeline:
             fig.savefig(plots / "training_loss.png", bbox_inches="tight")
             plt.close(fig)
 
-    # Draws the figures only a multi-draw run enables: the full metric
-    # distribution over every generation (not collapsed to best or mean),
-    # split by damage grade, and the per-image spread across draws, which
-    # shows how much the model's answers disagree for the same input.
-    # @params full: per-image, per-sample dataframe
-    # @params results: results folder
+    # Draw the figures only a multi-draw run enables: the full metric
+    # distribution over every generation (not collapsed to best or mean), split
+    # by damage grade, and the per-image spread across draws, which shows how
+    # much the model's answers disagree for the same input. full is the
+    # per-image, per-sample dataframe and results the results folder.
     def _make_generation_plots(self, full, results):
         import matplotlib
         matplotlib.use("Agg")
@@ -1126,13 +1100,11 @@ class CoinRestorationPipeline:
         fig.savefig(plots / "per_image_spread.png", bbox_inches="tight")
         plt.close(fig)
 
-    # Writes a human-readable evaluation report next to the csv outputs.
-    # @params full: per-image dataframe
-    # @params by_grade / by_chip / by_clip: grouped summary tables
-    # @params fid: FID scores dict or None
-    # @params best_of: best-of-N sample stats dict or None
-    # @params multi: whether several samples were drawn per image
-    # @params results: results folder
+    # Write a human-readable evaluation report next to the csv outputs. full is
+    # the per-image dataframe; by_grade / by_chip / by_clip the grouped summary
+    # tables; fid the FID scores (or None); best_of the best-of-N stats (or
+    # None); multi says whether several samples were drawn per image; results is
+    # the output folder.
     def _write_report(self, full, by_grade, by_chip, by_clip, fid, best_of,
                       multi, results):
         def stat(column):
@@ -1184,30 +1156,30 @@ class CoinRestorationPipeline:
 
         lines.append("## Files")
         lines.append("")
-        lines.append("- `results_per_image.csv` — every metric for every image")
-        lines.append("- `results_summary.csv` — the grouped tables above")
+        lines.append("- `results_per_image.csv`: every metric for every image")
+        lines.append("- `results_summary.csv`: the grouped tables above")
         if multi:
-            lines.append("- `plots/best/` — figures using each image's best draw")
-            lines.append("- `plots/average/` — figures using the mean over draws")
-            lines.append("- `plots/generations/` — full metric distributions "
+            lines.append("- `plots/best/`: figures using each image's best draw")
+            lines.append("- `plots/average/`: figures using the mean over draws")
+            lines.append("- `plots/generations/`: full metric distributions "
                          "over every draw, and the per-image spread")
-            lines.append("- `by_coin/<coin>/` — every sample, triptych and fan "
+            lines.append("- `by_coin/<coin>/`: every sample, triptych and fan "
                          "strip for each coin")
         else:
-            lines.append("- `plots/metrics_by_grade.png`, `plots/metrics_by_chip.png` "
-                         "— restored vs damaged by damage state")
-            lines.append("- `plots/lpips_improvement.png` — per-image before/after")
-            lines.append("- `plots/distributions.png` — metric histograms")
+            lines.append("- `plots/metrics_by_grade.png`, `plots/metrics_by_chip.png`: "
+                         "restored vs damaged by damage state")
+            lines.append("- `plots/lpips_improvement.png`: per-image before/after")
+            lines.append("- `plots/distributions.png`: metric histograms")
         if self.cfg.train_log and Path(self.cfg.train_log).exists():
             base = "plots/best" if multi else "plots"
-            lines.append(f"- `{base}/training_loss.png` — smoothed loss curve")
+            lines.append(f"- `{base}/training_loss.png`: smoothed loss curve")
 
         (Path(results) / "results_report.md").write_text("\n".join(lines) + "\n")
 
-    # Restores arbitrary coin images (e.g. a folder of scans) with a saved
-    # model. With --num-samples above 1 each coin gets its own subfolder
-    # holding every drawn restoration plus a fan strip (input | samples).
-    # @output restored PNGs in cfg.results, one subfolder per coin when multi
+    # Restore arbitrary coin images (say a folder of scans) with a saved model.
+    # With --num-samples above 1 each coin gets its own subfolder holding every
+    # drawn restoration plus a fan strip (input | samples). Restored PNGs land in
+    # cfg.results, one subfolder per coin in the multi-sample case.
     def restore(self):
         import torch
         from diffusers import DiffusionPipeline
@@ -1262,22 +1234,23 @@ class CoinRestorationPipeline:
                 else:
                     samples[0].save(flat_png)
 
-    # Measures train/test leakage between two folders of images. Every image
-    # is embedded with an ImageNet ResNet-50, each test image is matched to
-    # its nearest training neighbours by cosine similarity, and the top
-    # matches are re-scored with SSIM (and LPIPS when installed) at pixel
-    # level. A tall isolated peak in the similarity profile means a test coin
-    # has a near-duplicate sitting in the training set.
+    # Measure train/test leakage between two folders of images. Every image is
+    # embedded with an ImageNet ResNet-50, each test image is matched to its
+    # nearest training neighbours by cosine similarity, and the top matches are
+    # re-scored with SSIM (and LPIPS when installed) at pixel level. A tall
+    # isolated peak in the similarity profile means a test coin has a
+    # near-duplicate sitting in the training set.
     #
-    # With --results (an eval folder) the test set is first narrowed to the
-    # best, worst and an even spread of middle coins by mean restoration score
-    # over their generations, so the pixel scoring and montages run on a
-    # representative subset rather than every test coin. The test-vs-train
-    # cosine is a single matmul over cached embeddings either way, so the
-    # subset saves the scoring and rendering, not the search.
-    # @output leakage_pairs.csv, leakage_report.md, plots/ and either
-    #         top_pairs.jpg (full) or per-tier montages + a quality-vs-leakage
-    #         scatter (eval-guided) in cfg.out
+    # With --results (an eval folder) the test set is first narrowed to the best,
+    # worst and an even spread of middle coins by mean restoration score over
+    # their generations, so the pixel scoring and montages run on a
+    # representative subset rather than every test coin. The test-vs-train cosine
+    # is a single matmul over cached embeddings either way, so the subset saves
+    # the scoring and rendering, not the search.
+    #
+    # Everything lands in cfg.out: leakage_pairs.csv, leakage_report.md, plots/,
+    # and either top_pairs.jpg (full run) or the per-tier montages plus a
+    # quality-vs-leakage scatter (eval-guided run).
     def leakage(self):
         import pandas as pd
         import torch
@@ -1386,14 +1359,12 @@ class CoinRestorationPipeline:
             print(f"-> {out / 'plots' / 'quality_vs_leakage.png'}")
         print(f"-> {out / 'plots/'}")
 
-    # Ranks the evaluated test coins by their mean restoration metric over all
-    # generations and returns three tiers: the best group-size coins, the
-    # worst group-size, and group-size sampled at even rank intervals across
-    # the middle band, so the middle is a spread rather than a median cluster.
-    # @params results_dir: eval folder holding results_per_image.csv
-    # @params metric: one of lpips / psnr / ssim
-    # @params n: coins per tier
-    # @output list of {coin_id, tier, score}, best tier first
+    # Rank the evaluated test coins by their mean restoration metric over all
+    # generations and return three tiers: the best n coins, the worst n, and n
+    # more sampled at even rank intervals across the middle band, so the middle
+    # is a spread rather than a median cluster. results_dir is the eval folder
+    # holding results_per_image.csv and metric is one of lpips / psnr / ssim.
+    # Returns a list of {coin_id, tier, score}, best tier first.
     def _select_by_eval(self, results_dir, metric, n):
         import pandas as pd
 
@@ -1434,11 +1405,9 @@ class CoinRestorationPipeline:
               f"(of {len(ordered)} scored)")
         return selection
 
-    # Maps each selected coin_id to its scan in the test folder, matching on
-    # filename stem.
-    # @params test_dir: folder of test scans
-    # @params selection: list from _select_by_eval
-    # @output list of Paths, in selection order, for the coins that were found
+    # Map each selected coin_id (the selection list from _select_by_eval) to its
+    # scan in test_dir, matching on filename stem. Returns a list of Paths, in
+    # selection order, for the coins that were found.
     def _paths_for_coins(self, test_dir, selection):
         test_dir = Path(test_dir)
         by_stem = {}
@@ -1460,14 +1429,13 @@ class CoinRestorationPipeline:
             sys.exit(f"none of the selected coins were found in {test_dir}")
         return paths
 
-    # Renders one montage per quality tier (each coin beside its closest
-    # training match, labelled with its score and cosine) plus the scatter of
-    # restoration score against nearest-neighbour cosine.
-    # @params test_records / train_records: (name, path, face_idx) lists
-    # @params scores / indices: per-test top-k cosines and train indices
-    # @params tier_of: coin_id -> {tier, score} from _select_by_eval
-    # @params metric: ranking metric name, for labels
-    # @params out: output folder
+    # Render one montage per quality tier (each coin beside its closest training
+    # match, labelled with its score and cosine) plus the scatter of restoration
+    # score against nearest-neighbour cosine. test_records and train_records are
+    # (name, path, face_idx) lists; scores and indices hold the per-test top-k
+    # cosines and train indices; tier_of maps coin_id -> {tier, score} from
+    # _select_by_eval; metric names the ranking metric for the labels; out is the
+    # output folder.
     def _leakage_eval_montages(self, test_records, train_records, scores,
                                indices, tier_of, metric, out):
         # one representative pair per coin: the face whose closest training
@@ -1503,12 +1471,11 @@ class CoinRestorationPipeline:
 
         self._leakage_eval_scatter(points, metric, out)
 
-    # Scatter of each selected coin's restoration score against its
+    # Scatter each selected coin's restoration score against its
     # nearest-neighbour cosine, coloured by tier: if the best-restored coins
-    # cluster at high cosine, restoration quality is tracking leakage.
-    # @params points: list of {tier, score, cosine}
-    # @params metric: ranking metric name, for the axis label
-    # @params out: output folder
+    # cluster at high cosine, restoration quality is tracking leakage. points is
+    # a list of {tier, score, cosine}, metric names the ranking metric for the
+    # axis label, and out is the output folder.
     def _leakage_eval_scatter(self, points, metric, out):
         import matplotlib
         matplotlib.use("Agg")
@@ -1536,11 +1503,11 @@ class CoinRestorationPipeline:
         fig.savefig(out / "plots" / "quality_vs_leakage.png", bbox_inches="tight")
         plt.close(fig)
 
-    # Builds the embedding function: an ImageNet ResNet-50 with the
-    # classifier removed, so each image maps to a 2048-d feature whose cosine
-    # similarity acts as a perceptual nearness score.
-    # @params device: torch device string
-    # @output callable (list of PIL images) -> L2-normalized cpu tensor (n, 2048)
+    # Build the embedding function: an ImageNet ResNet-50 with the classifier
+    # removed, so each image maps to a 2048-d feature whose cosine similarity
+    # acts as a perceptual nearness score. device is a torch device string. The
+    # returned callable takes a list of PIL images and gives back an
+    # L2-normalized cpu tensor of shape (n, 2048).
     def _embedder(self, device):
         import torch
         from torchvision import models
@@ -1568,15 +1535,12 @@ class CoinRestorationPipeline:
 
         return embed
 
-    # Embeds a set of images (every segmented face of each when --segment is
-    # set), optionally serving from and writing to an on-disk cache. Pass
-    # either a folder to scan or an explicit list of paths.
-    # @params embed: batch embedding function from _embedder
-    # @params desc: progress bar label
-    # @params folder: directory of scans (scanned when paths is None)
-    # @params paths: explicit list of image paths to embed instead
-    # @params cache_dir: when set, reuse/store embeddings keyed by file content
-    # @output (records, embeddings) where records are (name, path, face_idx)
+    # Embed a set of images (every segmented face of each when --segment is set),
+    # optionally serving from and writing to an on-disk cache. Pass either a
+    # folder to scan or an explicit list of paths. embed is the batch embedding
+    # function from _embedder, desc the progress-bar label, and cache_dir (when
+    # set) reuses or stores embeddings keyed by file content. Returns
+    # (records, embeddings), where each record is (name, path, face_idx).
     def _embed_folder(self, embed, desc, folder=None, paths=None,
                       cache_dir=None):
         import torch
@@ -1628,9 +1592,8 @@ class CoinRestorationPipeline:
 
     # Content key for the embedding cache: the segment flag, the folder the
     # images live in, and each file's name, size and mtime, so any edit to the
-    # set (or moving it) recomputes rather than serving stale vectors.
-    # @params paths: the image paths being embedded
-    # @output short hex digest
+    # set (or moving it) recomputes rather than serving stale vectors. paths are
+    # the images being embedded. Returns a short hex digest.
     def _emb_cache_key(self, paths):
         digest = hashlib.md5()
         digest.update(f"seg={int(self.cfg.segment)}".encode())
@@ -1641,20 +1604,16 @@ class CoinRestorationPipeline:
                 f"{path.name}:{info.st_size}:{int(info.st_mtime)}".encode())
         return digest.hexdigest()[:16]
 
-    # Reloads one prepared face as a float array for pixel-level scoring.
-    # @params path: source image
-    # @params face_idx: which face of the image
-    # @output float array (res, res, 3) in [0, 1]
+    # Reload face face_idx of the image at path as a float array (res, res, 3)
+    # in [0, 1], for pixel-level scoring.
     def _face01(self, path, face_idx):
         img = self._input_faces(path)[face_idx][1]
         return np.asarray(img, dtype=np.float32) / 255.0
 
-    # Renders labelled test/train pairs two-per-row into one sheet, each test
-    # face beside its matched training face, so suspected leaks can be checked
-    # by eye.
-    # @params items: list of (label, test record, train record)
-    # @params path: destination jpg
-    # @params title: optional heading drawn across the top
+    # Render labelled test/train pairs two-per-row into one sheet, each test face
+    # beside its matched training face, so suspected leaks can be checked by eye.
+    # items is a list of (label, test record, train record), path the destination
+    # jpg, and title an optional heading drawn across the top.
     def _pair_sheet(self, items, path, title=None):
         from PIL import ImageDraw
 
@@ -1680,11 +1639,10 @@ class CoinRestorationPipeline:
             draw.text((x + 4, y + 7), label, fill=(20, 20, 20))
         sheet.save(path, quality=90)
 
-    # Draws the leakage figures: the nearest-neighbour similarity histogram,
-    # the sorted similarity profile, and cosine against SSIM for every top-1
-    # match.
-    # @params df: long-format pairs dataframe with a rank column
-    # @params out: output folder
+    # Draw the leakage figures: the nearest-neighbour similarity histogram, the
+    # sorted similarity profile, and cosine against SSIM for every top-1 match.
+    # df is the long-format pairs dataframe with a rank column, out the output
+    # folder.
     def _leakage_plots(self, df, out):
         import matplotlib
         matplotlib.use("Agg")
@@ -1737,12 +1695,10 @@ class CoinRestorationPipeline:
         fig.savefig(out / "plots/cosine_vs_ssim.png", bbox_inches="tight")
         plt.close(fig)
 
-    # Writes the human-readable leakage summary.
-    # @params df: long-format pairs dataframe
-    # @params n_test / n_train: image counts per folder
-    # @params selection: eval-guided tiers, or None for the full run
-    # @params metric: ranking metric name (used only in eval-guided mode)
-    # @params out: output folder
+    # Write the human-readable leakage summary. df is the long-format pairs
+    # dataframe, n_test / n_train the image counts per folder, selection the
+    # eval-guided tiers (or None for a full run), metric the ranking metric name
+    # (only used in eval-guided mode), and out the output folder.
     def _write_leakage_report(self, df, n_test, n_train, selection, metric, out):
         top1 = df[df["rank"] == 1]
         columns = [("cosine", "max"), ("ssim", "max")]
@@ -1808,40 +1764,33 @@ class CoinRestorationPipeline:
                      "in `top_pairs.jpg`.")
         (out / "leakage_report.md").write_text("\n".join(lines) + "\n")
 
-    # Prints a stage banner so the pipeline output is easy to scan.
-    # @params idx: stage number
-    # @params name: stage name
-    # @params note: optional skip reason
+    # Print a stage banner (stage idx of 4, its name, and an optional skip note)
+    # so the pipeline output is easy to scan.
     def _banner(self, idx, name, note=""):
         line = "=" * 64
-        suffix = f"  —  {note}" if note else ""
+        suffix = f"  -  {note}" if note else ""
         print(f"\n{line}\n  [{idx}/4] {name}{suffix}\n{line}", flush=True)
 
-    # Runs one stage and reports how long it took.
-    # @params stage: bound method to execute
+    # Run one stage (a bound method) and report how long it took.
     def _timed(self, stage):
         started = time.time()
         stage()
         minutes = (time.time() - started) / 60
         print(f"stage done in {minutes:.1f} min", flush=True)
 
-    # Appends _smoke to a path so smoke runs never collide with real ones.
-    # @params path_str: original path
-    # @output adjusted path string
+    # Append _smoke to a path so smoke runs never collide with the real ones.
     def _smoke_path(self, path_str):
         path = Path(path_str)
         return str(path.with_name(path.name + "_smoke"))
 
-    # Reads metadata rows for one split.
-    # @params split: train / val / test
-    # @output list of csv row dicts
+    # Read the metadata rows for one split (train / val / test) as a list of csv
+    # row dicts.
     def _metadata_rows(self, split):
         with open(Path(self.cfg.data) / "metadata.csv") as f:
             return [row for row in csv.DictReader(f) if row["split"] == split]
 
-    # Builds the torch Dataset of (damaged, clean, mask) tensors for training.
-    # @params split: train / val / test
-    # @output torch Dataset
+    # Build the torch Dataset of (damaged, clean, mask) tensors for one split
+    # (train / val / test).
     def _dataset(self, split):
         import torch
         from torch.utils.data import Dataset
@@ -1875,8 +1824,8 @@ class CoinRestorationPipeline:
 
         return Pairs()
 
-    # Loads the SDXL tokenizers, text encoders, vae and unet.
-    # @output dict of named components
+    # Load the SDXL tokenizers, text encoders, vae and unet into a dict of named
+    # components.
     def _load_sdxl_components(self):
         from diffusers import AutoencoderKL, UNet2DConditionModel
         from transformers import (CLIPTextModel, CLIPTextModelWithProjection,
@@ -1894,9 +1843,8 @@ class CoinRestorationPipeline:
             "unet": UNet2DConditionModel.from_pretrained(BASE_MODEL, subfolder="unet"),
         }
 
-    # Widens the unet input from 4 to 8 channels so it can take the damaged
-    # image latents next to the noisy latents; new weights start at zero.
-    # @params unet: SDXL UNet2DConditionModel
+    # Widen the unet input from 4 to 8 channels so it can take the damaged image
+    # latents next to the noisy ones; the new weights start at zero.
     def _expand_conv_in(self, unet):
         import torch
         import torch.nn as nn
@@ -1912,11 +1860,9 @@ class CoinRestorationPipeline:
         unet.conv_in = new
         unet.register_to_config(in_channels=8)
 
-    # Encodes text with both SDXL encoders.
-    # @params text: list with one prompt string
-    # @params components: dict from _load_sdxl_components
-    # @params device: target device
-    # @output (sequence embeddings, pooled embeddings)
+    # Encode text (a list with one prompt string) with both SDXL encoders.
+    # components comes from _load_sdxl_components. Returns (sequence embeddings,
+    # pooled embeddings).
     def _encode_prompt(self, text, components, device):
         import torch
 
@@ -1937,10 +1883,9 @@ class CoinRestorationPipeline:
 
         return torch.cat(embeds, dim=-1), pooled
 
-    # Assembles an SDXL InstructPix2Pix pipeline around the current unet.
-    # @params components: dict from _load_sdxl_components
-    # @params accelerator: the active Accelerator
-    # @output diffusers pipeline on the training device
+    # Assemble an SDXL InstructPix2Pix pipeline around the current unet, on the
+    # training device. components comes from _load_sdxl_components and
+    # accelerator is the active Accelerator.
     def _build_sdxl_pipe(self, components, accelerator):
         from diffusers import StableDiffusionXLInstructPix2PixPipeline
 
@@ -1953,11 +1898,10 @@ class CoinRestorationPipeline:
             tokenizer=components["tokenizer"],
             tokenizer_2=components["tokenizer_2"]).to(accelerator.device)
 
-    # Renders a damaged | restored | clean grid on the EMA weights.
-    # @params components / accelerator / ema: live training objects
-    # @params val_rows: metadata rows to preview
-    # @params out_path: destination png
-    # @params autocast_dtype / device: precision context
+    # Render a damaged | restored | clean grid on the EMA weights. components,
+    # accelerator and ema are the live training objects, val_rows the metadata
+    # rows to preview, out_path the destination png, and autocast_dtype / device
+    # set the precision context.
     def _save_preview(self, components, accelerator, ema, val_rows, out_path,
                       autocast_dtype, device):
         import torch
@@ -1999,10 +1943,8 @@ class CoinRestorationPipeline:
         torch.cuda.empty_cache()
         unet.train()
 
-    # Saves a rotating training checkpoint including the EMA weights.
-    # @params accelerator / ema: live training objects
-    # @params out_dir: training output directory
-    # @params global_step: current step, used in the checkpoint name
+    # Save a rotating training checkpoint (including the EMA weights) under
+    # out_dir. global_step is the current step, which names the checkpoint.
     def _save_checkpoint(self, accelerator, ema, out_dir, global_step):
         import torch
 
@@ -2014,8 +1956,8 @@ class CoinRestorationPipeline:
         accelerator.save_state(checkpoint_dir)
         torch.save(ema.state_dict(), checkpoint_dir / "ema.pt")
 
-    # Uploads the final model to a private Hugging Face repo.
-    # @params final_dir: folder with the saved pipeline
+    # Upload the final model (the saved pipeline in final_dir) to a private
+    # Hugging Face repo.
     def _push_to_hub(self, final_dir):
         from huggingface_hub import HfApi
 
@@ -2033,8 +1975,7 @@ class CoinRestorationPipeline:
         api.upload_folder(repo_id=self.cfg.push_to_hub, folder_path=str(final_dir))
         print(f"pushed -> https://huggingface.co/{self.cfg.push_to_hub}")
 
-    # Picks the best available inference device.
-    # @output (device name, torch dtype)
+    # Pick the best available inference device, as (device name, torch dtype).
     def _pick_device(self):
         import torch
 
@@ -2044,10 +1985,9 @@ class CoinRestorationPipeline:
             return "mps", torch.float32
         return "cpu", torch.float32
 
-    # Prepares one input file for restore(): either the whole image squared,
-    # or each segmented face when --segment is set.
-    # @params path: input image path
-    # @output list of (name suffix, PIL image) pairs
+    # Prepare one input file for restore(): either the whole image squared, or
+    # each segmented face when --segment is set. Returns a list of
+    # (name suffix, PIL image) pairs.
     def _input_faces(self, path):
         res = self.cfg.resolution
         image = Image.open(path).convert("RGB")
@@ -2068,9 +2008,8 @@ class CoinRestorationPipeline:
             prepared.append((f"_face{i}", squared(Image.fromarray(arr))))
         return prepared
 
-    # Bins the drawn chip amplitude into a readable severity label.
-    # @params row: one results row
-    # @output "none", "light", "medium" or "heavy"
+    # Bin the drawn chip amplitude of one results row into a readable severity
+    # label: "none", "light", "medium" or "heavy".
     def _chip_bin(self, row):
         if not row["has_chips"]:
             return "none"
@@ -2081,20 +2020,16 @@ class CoinRestorationPipeline:
             return "medium"
         return "heavy"
 
-    # Loads an image as float RGB in [0, 1] at the evaluation resolution.
-    # @params path: image file
-    # @params res: target resolution
-    # @output float array (res, res, 3)
+    # Load the image at path as a float RGB array (res, res, 3) in [0, 1], at the
+    # evaluation resolution res.
     def _load01(self, path, res):
         image = Image.open(path).convert("RGB")
         if image.size != (res, res):
             image = image.resize((res, res), Image.LANCZOS)
         return np.asarray(image, dtype=np.float32) / 255.0
 
-    # PSNR computed only over the coin mask.
-    # @params a, b: float images in [0, 1]
-    # @params mask: float mask
-    # @output PSNR in dB
+    # PSNR between float images a and b (in [0, 1]) computed only over the coin
+    # mask, in dB.
     def _masked_psnr(self, a, b, mask):
         denominator = mask.sum() * 3.0
         if denominator < 1:
@@ -2102,11 +2037,8 @@ class CoinRestorationPipeline:
         mse = float((((a - b) ** 2) * mask[..., None]).sum() / denominator)
         return float(10.0 * np.log10(1.0 / max(mse, 1e-10)))
 
-    # Mean of the SSIM map over the coin mask.
-    # @params a, b: float images in [0, 1]
-    # @params mask: float mask
-    # @params ssim_fn: skimage structural_similarity
-    # @output masked SSIM
+    # Mean of the SSIM map over the coin mask, for float images a and b in
+    # [0, 1]. ssim_fn is skimage's structural_similarity.
     def _masked_ssim(self, a, b, mask, ssim_fn):
         _, ssim_map = ssim_fn(a, b, channel_axis=2, data_range=1.0, full=True)
         selected = mask > 0.5
@@ -2114,10 +2046,9 @@ class CoinRestorationPipeline:
             return float("nan")
         return float(ssim_map[selected].mean())
 
-    # Builds an LPIPS scorer that compares images composited over white
-    # inside the coin mask.
-    # @params device: torch device string
-    # @output callable (clean, restored, mask) -> lpips distance
+    # Build an LPIPS scorer that compares images composited over white inside the
+    # coin mask. device is a torch device string. The returned callable takes
+    # (clean, restored, mask) and gives back an lpips distance.
     def _lpips_scorer(self, device):
         import lpips
         import torch
@@ -2135,8 +2066,8 @@ class CoinRestorationPipeline:
         return score
 
 
-# Builds the CLI: one subcommand per stage plus "run" for the full pipeline.
-# @output parsed argparse namespace
+# Build the CLI: one subcommand per stage, plus "run" for the full pipeline.
+# Returns the parsed argparse namespace.
 def parse_args():
     parser = argparse.ArgumentParser(
         description="coin restoration pipeline: damage -> train -> test")

@@ -23,12 +23,9 @@ def _disk(radius):
     return (xx * xx + yy * yy) <= r * r
 
 
-# Opening then closing with a disk. This deletes any bright or dark feature
-# smaller than the disk outright, which is what abrasion does to fine relief
-# (a plain blur would only dim it and leave a smudge).
-# @params img: float RGB image
-# @params size: disk radius in pixels
-# @output the smoothed image
+# Opening then closing with a disk of radius `size` pixels. This deletes any
+# bright or dark feature smaller than the disk outright, which is what abrasion
+# does to fine relief (a plain blur would only dim it and leave a smudge).
 def _morph_smooth(img, size):
     if size < 1:
         return img
@@ -41,14 +38,10 @@ def _morph_smooth(img, size):
 
 
 # Perona-Malik anisotropic diffusion. Detail melts away inside regions but
-# strong edges hold, so a worn design still reads by its outline. Each pass
-# lets intensity flow to the four neighbours, weighted so a big jump (an edge)
-# almost blocks the flow.
-# @params img: float RGB image
-# @params n_iter: number of passes
-# @params kappa: edge threshold; jumps above it stop the diffusion
-# @params step: integration step
-# @output the diffused image
+# strong edges hold, so a worn design still reads by its outline. Each of the
+# n_iter passes lets intensity flow to the four neighbours, weighted so a jump
+# bigger than kappa (an edge) almost blocks the flow. step is the integration
+# step size.
 def _perona_malik(img, n_iter, kappa, step=0.20):
     if n_iter < 1:
         return img.astype(np.float32)
@@ -57,23 +50,26 @@ def _perona_malik(img, n_iter, kappa, step=0.20):
     for _ in range(int(n_iter)):
         for c in range(out.shape[-1]):
             I = out[..., c]
+
+            # differences to the four neighbours
             dn = np.zeros_like(I); dn[1:, :] = I[:-1, :] - I[1:, :]
             ds = np.zeros_like(I); ds[:-1, :] = I[1:, :] - I[:-1, :]
             de = np.zeros_like(I); de[:, :-1] = I[:, 1:] - I[:, :-1]
             dw = np.zeros_like(I); dw[:, 1:] = I[:, :-1] - I[:, 1:]
+
+            # a jump bigger than kappa is an edge, so damp the flow across it
             cn = np.exp(-(dn / kappa) ** 2)
             cs = np.exp(-(ds / kappa) ** 2)
             ce = np.exp(-(de / kappa) ** 2)
             cw = np.exp(-(dw / kappa) ** 2)
+
             out[..., c] = I + step * (cn * dn + cs * ds + ce * de + cw * dw)
     return np.clip(out, 0.0, 1.0).astype(np.float32)
 
 
-# Splits an image into coarse and fine detail with a Gaussian low-pass in the
-# frequency domain. low + high adds back to the input.
-# @params img: float RGB image
-# @params cutoff: low-pass cutoff in cycles per pixel
-# @output (low band, high band)
+# Split an image into coarse and fine detail with a Gaussian low-pass in the
+# frequency domain; cutoff is in cycles per pixel. low + high adds back up to
+# the original, and that's what we return.
 def _fft_bands(img, cutoff):
     H, W = img.shape[:2]
     fy = np.fft.fftfreq(H)[:, None]
@@ -100,13 +96,10 @@ def _directional_streak(H, W, rng, angle, length):
 
 
 # Two streak directions plus a bit of fine grain, mixed into the faint scratch
-# signature that circulation leaves on the surface.
-# @params H, W: output size
-# @params rng: numpy generator
-# @params angle: main scratch direction in radians
-# @params scratch_len: streak length in pixels
-# @params scratch_weight: streaks vs isotropic grain
-# @output zero-mean, unit-spread texture
+# signature that circulation leaves on the surface. angle is the main scratch
+# direction in radians, scratch_len the streak length in pixels, and
+# scratch_weight trades the streaks off against isotropic grain. The result is
+# zero-mean with unit spread.
 def _abrasion_texture(H, W, rng, angle, scratch_len=3.5, scratch_weight=0.5):
     s1 = _directional_streak(H, W, rng, angle, scratch_len)
     s2 = _directional_streak(H, W, rng, angle + np.pi / 3.0, scratch_len)
@@ -127,18 +120,6 @@ def _abrasion_texture(H, W, rng, angle, scratch_len=3.5, scratch_weight=0.5):
 # them, cooks up a "worn metal" fill, and crossfades to it by the wear mask.
 class ClassicSandingFilter(DamageFilter):
 
-    # @params height_estimator: relief estimator, SignedRelief if left None
-    # @params depth: how far down the relief the plane reaches
-    # @params softness: half-width of the soft contact band around the plane
-    # @params spread: dilation radius that merges neighbouring worn patches
-    # @params knockdown_size: smallest surviving feature, in pixels
-    # @params diffusion_iter / diffusion_kappa: Perona-Malik settings
-    # @params fft_cutoff / hf_attenuation / lowfreq_keep: the frequency mix
-    # @params plane_jitter: strength of the wavy plane wobble
-    # @params noise_sigma: blur radius of that wobble
-    # @params radial_bias: how hard the plane sags toward the rim
-    # @params burnish_amount: pull of the fill toward the coin's highlight tone
-    # @params abrasion_texture: strength of the scratch texture
     def __init__(self,
                  height_estimator=None,
                  depth=0.35,
@@ -155,21 +136,29 @@ class ClassicSandingFilter(DamageFilter):
                  radial_bias=0.15,
                  burnish_amount=0.45,
                  abrasion_texture=0.06):
+        # relief estimator, defaulting to SignedRelief
         self.height_estimator = height_estimator or SignedRelief()
-        self.depth = depth
-        self.softness = softness
-        self.spread = spread
-        self.knockdown_size = knockdown_size
+
+        # where the imaginary sanding plane bites
+        self.depth = depth                    # how far down the relief it reaches
+        self.softness = softness              # half-width of the soft contact band
+        self.spread = spread                  # dilation that merges nearby worn patches
+        self.knockdown_size = knockdown_size  # smallest feature that survives, in pixels
+
+        # how the worn-metal fill is cooked up: diffusion then a frequency mix
         self.diffusion_iter = diffusion_iter
         self.diffusion_kappa = diffusion_kappa
         self.fft_cutoff = fft_cutoff
         self.hf_attenuation = hf_attenuation
         self.lowfreq_keep = lowfreq_keep
-        self.plane_jitter = plane_jitter
-        self.noise_sigma = noise_sigma
-        self.radial_bias = radial_bias
-        self.burnish_amount = burnish_amount
-        self.abrasion_texture = abrasion_texture
+
+        # the plane isn't flat: it wobbles and sags toward the rim
+        self.plane_jitter = plane_jitter      # strength of the wobble
+        self.noise_sigma = noise_sigma        # blur radius of that wobble
+        self.radial_bias = radial_bias        # how hard it sags toward the rim
+
+        self.burnish_amount = burnish_amount  # pull of the fill toward the highlight tone
+        self.abrasion_texture = abrasion_texture   # strength of the scratch texture
 
     # every knob moves the same way from Very Fine down to About Good
     _GRADES = {
@@ -191,11 +180,8 @@ class ClassicSandingFilter(DamageFilter):
         return cls(height_estimator=height_estimator or SignedRelief(),
                    **cls._GRADES[grade])
 
-    # Runs the wear on one face.
-    # @params image: float RGB image in [0, 1]
-    # @params coin_mask: float mask of the coin pixels
-    # @params seed: seed for the jitter and scratch randomness
-    # @output DamageResult, with the wear mask as damage_mask
+    # Run the wear on one face. seed drives the plane jitter and the scratch
+    # randomness. Returns a DamageResult with the wear mask as its damage_mask.
     def apply(self, image, coin_mask, seed=None) -> DamageResult:
         rng = np.random.default_rng(seed)
         img = image.astype(np.float32)

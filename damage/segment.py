@@ -13,13 +13,9 @@ class Face:
     name: str
 
 
-# Pulls the coin faces out of a scan shot on a white background. Anything
-# darker than the cutoff counts as foreground; blobs big enough to matter
-# become faces, handed back left to right.
-# @params rgb_uint8: the scan as a uint8 RGB array
-# @params white_cutoff: grey level above which a pixel is background
-# @params min_area_frac: smallest blob to keep, as a fraction of the image
-# @output list of Face objects, ordered left to right
+# Pull the coin faces out of a scan shot on a white background. Anything darker
+# than white_cutoff counts as foreground; blobs bigger than min_area_frac of the
+# image become faces. Returns a list of Face objects ordered left to right.
 def segment_faces(rgb_uint8, white_cutoff=250, min_area_frac=0.02):
     grey = rgb_uint8.mean(axis=2)
     fg = ndimage.binary_fill_holes(grey < white_cutoff)

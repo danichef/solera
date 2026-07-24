@@ -9,28 +9,20 @@ from . import silver_relight as relight
 # gleam like handled silver instead of looking airbrushed.
 class SilverWearFilter(DamageFilter):
 
-    # @params grade: preset name handed on to the sanding filter
-    # @params spec_gain / shininess / gate_pct: specular glint settings
-    # @params silver_boost: pull toward the coin's metal tone
-    # @params fine_amt: fine detail in the shading normals
-    # @params shadow_lift: strength of the dark-blob cleanup
-    # @params brightness_bias: target brightness vs the original
-    # @params light: fixed light direction, or None to estimate it
-    # @params spec_grain: hairline scratches carved out of the shine
     def __init__(self, grade="vg", spec_gain=2.1, shininess=10.0,
                  silver_boost=0.55, fine_amt=0.25, gate_pct=45.0,
                  shadow_lift=0.6, brightness_bias=1.0, light=None,
                  spec_grain=0.0):
-        self.grade = grade
-        self.spec_gain = spec_gain
+        self.grade = grade                       # preset name handed to the sanding filter
+        self.spec_gain = spec_gain               # how bright the specular glint gets
         self.shininess = shininess
-        self.silver_boost = silver_boost
-        self.fine_amt = fine_amt
-        self.gate_pct = gate_pct
-        self.shadow_lift = shadow_lift
-        self.brightness_bias = brightness_bias
-        self.light = light
-        self.spec_grain = spec_grain
+        self.gate_pct = gate_pct                 # keeps the shine out of dark recesses
+        self.silver_boost = silver_boost         # pull toward the coin's metal tone
+        self.fine_amt = fine_amt                 # fine detail in the shading normals
+        self.shadow_lift = shadow_lift           # strength of the dark-blob cleanup
+        self.brightness_bias = brightness_bias   # target brightness vs the original
+        self.light = light                       # fixed light direction, None to estimate it
+        self.spec_grain = spec_grain             # hairline scratches carved out of the shine
 
     _GRADES = {
         "vf": dict(grade="vf", spec_gain=1.6, shininess=12.0, silver_boost=0.45, shadow_lift=0.40, gate_pct=46.0, spec_grain=0.25),
@@ -47,11 +39,9 @@ class SilverWearFilter(DamageFilter):
         cfg.update(overrides)
         return cls(**cfg)
 
-    # Wears the coin and relights it.
-    # @params image: float RGB image in [0, 1]
-    # @params coin_mask: float mask of the coin pixels
-    # @params seed: seed shared by the sanding and the relight randomness
-    # @output DamageResult carrying the sanding wear mask
+    # Wear the coin down, then relight it. The seed is shared by the sanding and
+    # the relight randomness, so the same seed always gives back the same coin.
+    # Returns a DamageResult carrying the sanding wear mask.
     def apply(self, image, coin_mask, seed=None) -> DamageResult:
         img = image.astype(np.float32)
         inside = coin_mask > 0.5
